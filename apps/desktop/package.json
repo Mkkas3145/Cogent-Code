@@ -1,0 +1,22 @@
+{
+  "name": "@cogent/desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "../../apps/dist/apps/desktop/electron-main/main.js",
+  "scripts": {
+    "dev": "concurrently \"tsc -p electron-main/tsconfig.json --watch --preserveWatchOutput\" \"wait-on ../../apps/dist/apps/desktop/electron-main/main.js tcp:5173 && electron ../../apps/dist/apps/desktop/electron-main/main.js\"",
+    "build": "tsc -p electron-main/tsconfig.json",
+    "typecheck": "tsc -p electron-main/tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@cogent/agent-core": "0.1.0",
+    "@cogent/command-runtime": "0.1.0",
+    "@cogent/shared-types": "0.1.0",
+    "electron": "^37.2.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "tsx": "^4.20.6"
+  }
+}

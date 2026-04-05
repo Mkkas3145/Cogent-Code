@@ -1,0 +1,15 @@
+node_modules/
+release/
+apps/dist/
+dist/
+build/
+coverage/
+.DS_Store
+Thumbs.db
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+apps/desktop/renderer/dist/
+apps/desktop/electron-main/dist/
+*.tsbuildinfo

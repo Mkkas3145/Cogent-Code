@@ -1,0 +1,59 @@
+{
+  "name": "cogent-code",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "apps/dist-release/electron-main/main.js",
+  "workspaces": [
+    "apps/*",
+    "apps/desktop/renderer",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm:dev:renderer\" \"npm:dev:main\"",
+    "dev:renderer": "npm --workspace @cogent/renderer run dev",
+    "dev:main": "npm --workspace @cogent/desktop run dev",
+    "build": "npm run build:renderer && npm run build:main",
+    "build:renderer": "npm --workspace @cogent/renderer run build",
+    "build:main": "npm --workspace @cogent/desktop run build",
+    "build:desktop:bundle": "node scripts/build-desktop-main.mjs",
+    "build:desktop:release": "npm run build:renderer && npm run build:desktop:bundle",
+    "dist:win": "npm run build:desktop:release && electron-builder --win nsis",
+    "pack:win": "npm run build:desktop:release && electron-builder --win portable",
+    "typecheck": "npm --workspaces --if-present run typecheck"
+  },
+  "build": {
+    "appId": "com.cogent.code",
+    "productName": "Cogent Code",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "apps/dist-release/electron-main/**/*",
+      "apps/desktop/electron-main/preload.cjs",
+      "apps/desktop/renderer/dist/**/*"
+    ],
+    "extraMetadata": {
+      "main": "apps/dist-release/electron-main/main.js"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "artifactName": "Cogent-Code-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "electron-builder": "^26.8.1",
+    "esbuild": "^0.28.0",
+    "typescript": "^5.9.3",
+    "wait-on": "^8.0.5"
+  }
+}
