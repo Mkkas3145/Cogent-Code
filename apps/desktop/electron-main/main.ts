@@ -932,8 +932,15 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle("system:read-file", async (_event, filePath: string) => {
-    const content = await readFile(filePath, "utf8");
-    return { path: filePath, content };
+    try {
+      const content = await readFile(filePath, "utf8");
+      return { path: filePath, content };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return { path: filePath, content: "", missing: true };
+      }
+      throw error;
+    }
   });
 
   ipcMain.handle("system:open-path", async (event, targetPath: string) => {

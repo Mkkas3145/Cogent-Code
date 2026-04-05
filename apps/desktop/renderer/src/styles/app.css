@@ -272,6 +272,10 @@ textarea {
   margin-top: 4px;
   font-size: 11px;
   color: var(--muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .session-delete {
@@ -871,6 +875,10 @@ textarea {
   margin: 0 auto;
 }
 
+.message-row:has(.tool-group-card) + .message-row {
+  margin-top: -20px;
+}
+
 .chat-column.is-empty {
   min-height: calc(100vh - 260px);
   justify-content: center;
@@ -1052,6 +1060,7 @@ textarea {
   gap: 8px;
 }
 
+.message-edit-delete,
 .message-edit-cancel,
 .message-edit-save {
   width: 32px;
@@ -1064,11 +1073,18 @@ textarea {
   transition: background-color 0.16s ease, color 0.16s ease, border-color 0.16s ease;
 }
 
+.message-edit-delete svg,
 .message-edit-cancel svg,
 .message-edit-save svg {
   width: 12px;
   height: 12px;
   fill: currentColor;
+}
+
+.message-edit-delete {
+  border: 1px solid rgba(234, 95, 95, 0.24);
+  background: transparent;
+  color: rgba(255, 145, 145, 0.88);
 }
 
 .message-edit-cancel {
@@ -1081,6 +1097,12 @@ textarea {
   border: 0;
   background: #ffffff;
   color: rgba(10, 10, 10, 0.82);
+}
+
+.message-edit-delete:hover {
+  background: rgba(234, 95, 95, 0.12);
+  color: rgba(255, 184, 184, 0.96);
+  border-color: rgba(234, 95, 95, 0.4);
 }
 
 .message-edit-cancel:hover {

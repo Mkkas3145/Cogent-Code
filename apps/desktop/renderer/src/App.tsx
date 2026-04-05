@@ -29,6 +29,7 @@ type FileTreeNode = {
 type FilePreview = {
   path: string;
   content: string;
+  missing?: boolean;
 };
 type OpenPathResult =
   | {
@@ -1041,6 +1042,8 @@ const COPY = {
     resetWarningConfirm: "Reset",
     cancel: "Cancel",
     save: "Save",
+    delete: "Delete",
+    deleteMessage: "Delete message",
     sessions: "Sessions",
     newSession: "New Session",
     emptySessionTitle: "Empty Session",
@@ -1135,6 +1138,8 @@ const COPY = {
     resetWarningConfirm: "초기화",
     cancel: "취소",
     save: "저장",
+    delete: "삭제",
+    deleteMessage: "메시지 삭제",
     sessions: "세션",
     newSession: "새 세션",
     emptySessionTitle: "빈 세션",
@@ -1229,6 +1234,8 @@ const COPY = {
     resetWarningConfirm: "初期化",
     cancel: "キャンセル",
     save: "保存",
+    delete: "削除",
+    deleteMessage: "メッセージを削除",
     sessions: "セッション",
     newSession: "新しいセッション",
     emptySessionTitle: "空のセッション",
@@ -1382,7 +1389,30 @@ function isChatMessage(value: unknown): value is ChatMessage {
   }
 
   const message = value as Partial<ChatMessage>;
-  return typeof message.id === "string" && (message.role === "user" || message.role === "assistant");
+  const attachmentsValid =
+    message.attachments === undefined ||
+    (Array.isArray(message.attachments) &&
+      message.attachments.every(
+        (attachment) =>
+          attachment &&
+          typeof attachment.id === "string" &&
+          typeof attachment.name === "string" &&
+          typeof attachment.mimeType === "string" &&
+          typeof attachment.dataUrl === "string",
+      ));
+  const fileAttachmentsValid =
+    message.fileAttachments === undefined ||
+    (Array.isArray(message.fileAttachments) &&
+      message.fileAttachments.every(
+        (attachment) =>
+          attachment &&
+          typeof attachment.id === "string" &&
+          typeof attachment.name === "string" &&
+          typeof attachment.mimeType === "string" &&
+          typeof attachment.content === "string",
+      ));
+
+  return typeof message.id === "string" && (message.role === "user" || message.role === "assistant") && attachmentsValid && fileAttachmentsValid;
 }
 
 function isChatSession(value: unknown): value is ChatSession {
@@ -1854,6 +1884,34 @@ export function App() {
   function handleCancelMessageEdit() {
     setEditingMessageId(null);
     setEditingMessageText("");
+  }
+
+  async function handleDeleteMessageEdit() {
+    const currentSessionId = activeSession?.id;
+    const targetMessageId = editingMessageId;
+    if (!currentSessionId || !targetMessageId) {
+      return;
+    }
+
+    if (isAgentRunning) {
+      await cancelCurrentAgentRun();
+    }
+
+    const targetIndex = messages.findIndex((message) => message.id === targetMessageId);
+    if (targetIndex === -1) {
+      return;
+    }
+
+    const nextMessages = messages.slice(0, targetIndex);
+
+    updateSessionById(currentSessionId, (session) => ({
+      ...session,
+      messages: nextMessages,
+    }));
+
+    handleCancelMessageEdit();
+    shouldFollowChatRef.current = true;
+    pendingScrollBehaviorRef.current = "auto";
   }
 
   function handleToggleToolGroup(groupId: string) {
@@ -2361,11 +2419,7 @@ export function App() {
       return;
     }
 
-    const serializableSessions = sessions.map((session) => ({
-      ...session,
-      messages: session.messages.map(({ attachments: _attachments, fileAttachments: _fileAttachments, ...message }) => message),
-    }));
-    window.localStorage.setItem(CHAT_SESSIONS_STORAGE_KEY, JSON.stringify(serializableSessions));
+    window.localStorage.setItem(CHAT_SESSIONS_STORAGE_KEY, JSON.stringify(sessions));
   }, [sessions]);
 
   useEffect(() => {
@@ -3701,6 +3755,27 @@ export function App() {
     }
 
     const preview = await cogent.readFile(node.path);
+    if (preview.missing) {
+      const tree = await cogent.getFileTree();
+      setFileTree(tree.children ?? []);
+      setWorkspaceRoot(tree.rootPath);
+      setWorkspaceName(tree.name);
+      setExpandedPaths((current) => ({
+        ...current,
+        [tree.rootPath]: true,
+      }));
+      if (selectedFile?.path === node.path) {
+        setSelectedFile({ path: node.path, content: "", missing: true });
+        setCode("");
+      }
+      manualFileSelectionVersionRef.current += 1;
+      setShouldAutoOpenEditor(true);
+      setSelectedFile({ path: node.path, content: "", missing: true });
+      setCode("");
+      setIsFileRailDismissed(true);
+      setCanRestoreFileRail(false);
+      return;
+    }
     manualFileSelectionVersionRef.current += 1;
     setShouldAutoOpenEditor(true);
     setSelectedFile(preview);
@@ -3716,6 +3791,25 @@ export function App() {
     }
 
     const preview = await cogent.readFile(path);
+    if (preview.missing) {
+      const tree = await cogent.getFileTree();
+      setFileTree(tree.children ?? []);
+      setWorkspaceRoot(tree.rootPath);
+      setWorkspaceName(tree.name);
+      setExpandedPaths((current) => ({
+        ...current,
+        [tree.rootPath]: true,
+      }));
+      if (selectedFile?.path === path) {
+        setSelectedFile({ path, content: "", missing: true });
+        setCode("");
+      }
+      manualFileSelectionVersionRef.current += 1;
+      setShouldAutoOpenEditor(true);
+      setSelectedFile({ path, content: "", missing: true });
+      setCode("");
+      return;
+    }
     manualFileSelectionVersionRef.current += 1;
     setShouldAutoOpenEditor(true);
     setSelectedFile(preview);
@@ -4525,6 +4619,9 @@ export function App() {
                     <div className="message-card user-card user-card-editing">
                       <textarea ref={editingTextareaRef} className="message-edit-textarea" value={editingMessageText} onChange={(event) => setEditingMessageText(event.target.value)} onKeyDown={handleEditMessageKeyDown} rows={2} />
                       <div className="message-edit-actions">
+                        <button className="message-edit-delete" onClick={() => void handleDeleteMessageEdit()} aria-label={text.deleteMessage} title={text.delete} type="button">
+                          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 30 32"><path d="M11.5 0C9.032 0 7 2.032 7 4.5V6H1.5c-2 0-2 3 0 3H3v17.5C3 29.52 5.48 32 8.5 32h13c3.02 0 5.5-2.48 5.5-5.5V9h1.5c2 0 2-3 0-3H23V4.5C23 2.032 20.968 0 18.5 0Zm0 3h7c.846 0 1.5.654 1.5 1.5V6H10V4.5c0-.846.654-1.5 1.5-1.5ZM6 9h18v17.5c0 1.398-1.102 2.5-2.5 2.5h-13A2.478 2.478 0 0 1 6 26.5Zm5.5 5c-.83 0-1.5.67-1.5 1.5v7c0 2 3 2 3 0v-7c0-.83-.67-1.5-1.5-1.5Zm7 0c-.83 0-1.5.67-1.5 1.5v7c0 2 3 2 3 0v-7c0-.83-.67-1.5-1.5-1.5Z" /></svg>
+                        </button>
                         <button className="message-edit-cancel" onClick={handleCancelMessageEdit} aria-label={text.cancel} type="button">
                           <svg xmlns="http://www.w3.org/2000/svg" xmlSpace="preserve" viewBox="0 0 32 32"><path d="M5.746 4.246a1.5 1.5 0 0 0-1.06.44 1.5 1.5 0 0 0 0 2.12L13.879 16l-9.193 9.193a1.5 1.5 0 0 0 0 2.121 1.5 1.5 0 0 0 2.12 0L16 18.121l9.193 9.193a1.5 1.5 0 0 0 2.121 0 1.5 1.5 0 0 0 0-2.12L18.121 16l9.193-9.193a1.5 1.5 0 0 0 0-2.121 1.5 1.5 0 0 0-1.06-.44 1.5 1.5 0 0 0-1.06.44L16 13.879 6.807 4.686a1.5 1.5 0 0 0-1.06-.44Z" /></svg>
                         </button>

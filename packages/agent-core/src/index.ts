@@ -419,6 +419,25 @@ const FILE_TOOLS = [
       required: ["url", "title", "description", "helpNeeded", "steps"],
     },
   },
+  {
+    name: "finish_turn",
+    description:
+      "Explicitly finish the current turn only when you are truly done or clearly blocked. Always include a short user-facing plain-language message.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        message: {
+          type: "STRING",
+          description: "Short plain-language body text to show the user before the turn ends.",
+        },
+        summary: {
+          type: "STRING",
+          description: "Short internal completion summary.",
+        },
+      },
+      required: ["message"],
+    },
+  },
 ];
 
 const OLLAMA_TOOL_DEFINITIONS = FILE_TOOLS.map((tool) => ({
@@ -573,14 +592,30 @@ function buildSystemInstruction(request: TaskRequest, decision: ModeDecision, re
     "If a command exits non-zero or any tool returns an error, do not present the task as complete. Explain that it failed and what remains blocked.",
     "Before claiming that a file or folder changed state, rely on the tool result, and if there is any doubt, verify by reading the file again or listing the directory again.",
     "If a verification step fails or is impossible, say that clearly instead of implying success.",
+    "For any meaningful edit, creation, deletion, command run, or browser task, perform an explicit verification step before saying it worked whenever verification is reasonably possible.",
+    "Do not stop at the first successful tool call. If the user asked for a change, verify the resulting state and only then describe it as done.",
+    "Do not end the task at an ambiguous halfway point. Continue until the requested work is actually completed, clearly blocked, or explicitly handed back to the user for a specific reason.",
+    "A successful tool call is not the finish line. Finishing requires the underlying user request to be satisfied, not merely a partial action to have happened.",
+    "Before you finish a turn, do a final internal checklist: what did the user ask for, what actions succeeded, what still needs verification, and is anything still unfinished or uncertain.",
+    "If anything important remains uncertain, incomplete, unverified, or possibly broken, do not end with a done tone. Keep working or explain the exact blocker.",
+    "When you edited code or changed files, prefer to verify by re-reading the changed file, listing the affected directory, or running an appropriate validation command when practical.",
+    "When you ran a command for build, test, install, search, or verification, inspect the result and decide what to do next instead of stopping immediately after the command completes.",
+    "If a tool fails because of a wrong path, missing file, missing directory, or similar mistake, treat that as a cue to recover and keep going rather than silently ending the attempt.",
+    "During longer work, leave short conversational progress updates in the assistant body at meaningful milestones instead of staying silent until the very end.",
+    "If you performed several tool actions in a row, summarize the current state in plain language before moving on or finishing.",
+    "After several consecutive tool calls, pause and write a brief body update before continuing so the user is not left with a silent tool-only sequence.",
     "Empty folders may be removed with delete_directory. Do not use it on non-empty folders.",
     "You may chat casually between edits. Natural conversation is allowed even in the middle of code work.",
     "Use tools in multiple steps when needed: inspect, reason, edit, verify mentally, then respond.",
     "When making a real code change, use write_file, create_file, delete_file, or delete_directory instead of shelling out or pasting code into the chat.",
     "Do not paste large code blocks or full files in your conversational reply unless the user explicitly asks to see the code.",
     "After tool work, explain clearly what you changed or what you found in plain language.",
+    "You must decide when the turn is actually complete. Do not rely on the runtime to assume completion from silence.",
+    "Only finish a turn by calling finish_turn with a short user-facing message once you are truly done or clearly blocked.",
+    "Do not call finish_turn at an ambiguous midpoint, after only partial work, or before verification that should reasonably happen.",
     "Always leave at least one conversational body line before finishing a turn, even when the task is blocked, handed off to the user, or waiting for browser assistance.",
     "Do not end a turn with only tool output, status changes, or UI actions. Leave a short plain-language message that explains the current state and what comes next.",
+    "This applies to every turn without exception: never finish with zero assistant body text.",
     decision.mode === "auto"
       ? "Preferred mode: auto. Decide the best workflow yourself from the user's request and tool results."
       : `Preferred mode: ${decision.mode}.`,
@@ -1294,6 +1329,32 @@ function parseOllamaToolCalls(message: OllamaChatResponse["message"]): Array<{ n
   });
 }
 
+function getFinishTurnPayload(args: Record<string, unknown>) {
+  const message = typeof args.message === "string" ? args.message.trim() : "";
+  const summary = typeof args.summary === "string" ? args.summary.trim() : "";
+  return { message, summary };
+}
+
+async function waitUntilAborted(signal?: AbortSignal) {
+  if (!signal) {
+    await new Promise<never>(() => {});
+    return;
+  }
+
+  if (signal.aborted) {
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    const handleAbort = () => {
+      signal.removeEventListener("abort", handleAbort);
+      resolve();
+    };
+
+    signal.addEventListener("abort", handleAbort, { once: true });
+  });
+}
+
 function buildOllamaMessages(
   request: TaskRequest,
   decision: ModeDecision,
@@ -1356,6 +1417,22 @@ async function* runGeminiAgentLoop(
     const parts = candidate.content?.parts ?? [];
     const functionCalls = getFunctionCalls(parts);
 
+    const finishCall = functionCalls.find((call) => call.name === "finish_turn");
+    if (finishCall) {
+      const payload = getFinishTurnPayload(finishCall.args);
+      if (payload.message) {
+        yield { type: "message", chunk: payload.message };
+      }
+      yield { type: "done", summary: payload.summary || "Agent turn completed." };
+      return;
+    }
+
+    for (const call of functionCalls) {
+      if ((call.name === "write_file" || call.name === "create_file") && typeof call.args.path === "string" && call.args.path.trim()) {
+        yield { type: "file-write-start", path: call.args.path };
+      }
+    }
+
     if (functionCalls.length === 0) {
       let streamedAggregatedText = "";
       let emittedMessageLength = 0;
@@ -1399,7 +1476,12 @@ async function* runGeminiAgentLoop(
         yield { type: "code", chunk: finalParts.code.slice(emittedCodeLength) };
       }
 
-      yield { type: "done", summary: "Gemini response completed." };
+      currentContents.push({
+        role: "model",
+        parts: streamedCandidate.content?.parts ?? parts,
+      });
+      await waitUntilAborted(signal);
+      yield { type: "done", summary: "Agent request canceled." };
       return;
     }
 
@@ -1409,7 +1491,7 @@ async function* runGeminiAgentLoop(
     });
 
     const responseParts: GeminiPart[] = [];
-    for (const call of functionCalls) {
+    for (const call of functionCalls.filter((entry) => entry.name !== "finish_turn")) {
       const execution = executeToolCall(call, handlers);
       const iterator = execution[Symbol.asyncIterator]();
       while (true) {
@@ -1464,8 +1546,29 @@ async function* runOllamaAgentLoop(
     }
 
     const toolCalls = parseOllamaToolCalls(latestResponse.message);
+    const finishCall = toolCalls.find((call) => call.name === "finish_turn");
+    if (finishCall) {
+      const payload = getFinishTurnPayload(finishCall.args);
+      if (payload.message) {
+        yield { type: "message", chunk: payload.message };
+      }
+      yield { type: "done", summary: payload.summary || "Agent turn completed." };
+      return;
+    }
+
+    for (const call of toolCalls) {
+      if ((call.name === "write_file" || call.name === "create_file") && typeof call.args.path === "string" && call.args.path.trim()) {
+        yield { type: "file-write-start", path: call.args.path };
+      }
+    }
+
     if (toolCalls.length === 0) {
-      yield { type: "done", summary: "Ollama response completed." };
+      messages.push({
+        role: "assistant",
+        content: latestResponse.message?.content ?? "",
+      });
+      await waitUntilAborted(signal);
+      yield { type: "done", summary: "Agent request canceled." };
       return;
     }
 
@@ -1475,7 +1578,7 @@ async function* runOllamaAgentLoop(
       tool_calls: latestResponse.message?.tool_calls,
     });
 
-    for (const call of toolCalls) {
+    for (const call of toolCalls.filter((entry) => entry.name !== "finish_turn")) {
       const execution = executeToolCall(call, handlers);
       const iterator = execution[Symbol.asyncIterator]();
       while (true) {

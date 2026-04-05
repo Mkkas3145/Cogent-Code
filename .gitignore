@@ -1,6 +1,7 @@
 node_modules/
 release/
 apps/dist/
+apps/dist-release/
 dist/
 build/
 coverage/
