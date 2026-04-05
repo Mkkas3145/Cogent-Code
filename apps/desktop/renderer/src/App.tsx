@@ -8,6 +8,8 @@ import type {
   ConversationTurn,
   ContextSnapshot,
   ContextUsageSnapshot,
+  GeminiModelSummary,
+  LmStudioModelSummary,
   ModelProvider,
   ModelTier,
   OllamaModelSummary,
@@ -46,6 +48,12 @@ type OpenPathResult =
       content: string;
       children: FileTreeNode[];
     };
+type PendingModelSelectionWarning = {
+  provider: "ollama" | "lmstudio";
+  modelId: string;
+  title: string;
+  description: string;
+};
 type TextChunk = {
   id: number;
   start: number;
@@ -213,7 +221,117 @@ function formatInteger(value: number) {
 }
 
 function formatThousandsWithSuffix(value: number) {
-  return `${Math.round(value / 1000).toLocaleString()}k`;
+  return `${Math.round(value / 1024).toLocaleString()}k`;
+}
+
+function getGeminiMenuDescription(model: GeminiModelSummary, locale: Locale) {
+  const inputLimit = model.inputTokenLimit ? formatThousandsWithSuffix(model.inputTokenLimit) : null;
+  const outputLimit = model.outputTokenLimit ? formatThousandsWithSuffix(model.outputTokenLimit) : null;
+  const separator = " · ";
+
+  if (locale === "ko") {
+    return [inputLimit ? `입력 ${inputLimit}` : null, outputLimit ? `출력 ${outputLimit}` : null]
+      .filter(Boolean)
+      .join(separator) || "입력/출력 토큰 미확인";
+  }
+  if (locale === "ja") {
+    return [inputLimit ? `入力 ${inputLimit}` : null, outputLimit ? `出力 ${outputLimit}` : null]
+      .filter(Boolean)
+      .join(separator) || "入力/出力トークン不明";
+  }
+  return [inputLimit ? `Input ${inputLimit}` : null, outputLimit ? `Output ${outputLimit}` : null]
+    .filter(Boolean)
+    .join(separator) || "Input/output limits unknown";
+}
+
+function getDefaultLmStudioContextLength(totalMemoryBytes?: number) {
+  if (!totalMemoryBytes || totalMemoryBytes <= 0) {
+    return "";
+  }
+  const totalMemoryGb = (totalMemoryBytes ?? 0) / 1024 / 1024 / 1024;
+  const reservedForSystemGb = Math.max(4, totalMemoryGb * 0.25);
+  const usableMemoryGb = Math.max(4, totalMemoryGb - reservedForSystemGb);
+  const estimatedContext = Math.floor(usableMemoryGb * 512);
+  const clampedContext = Math.max(4096, Math.min(32768, estimatedContext));
+  return String(Math.round(clampedContext / 1024) * 1024);
+}
+
+function getDefaultOllamaContextLength(totalMemoryBytes?: number) {
+  return getDefaultLmStudioContextLength(totalMemoryBytes);
+}
+
+function parseParameterBillions(rawValue: string | undefined) {
+  if (!rawValue) {
+    return null;
+  }
+
+  const match = rawValue.toLowerCase().match(/(\d+(?:\.\d+)?)\s*b/);
+  if (!match) {
+    return null;
+  }
+
+  const numericValue = Number(match[1]);
+  return Number.isFinite(numericValue) ? numericValue : null;
+}
+
+function estimateModelWeightBytes(provider: "ollama" | "lmstudio", model: OllamaModelSummary | LmStudioModelSummary) {
+  if ("size" in model && typeof model.size === "number" && model.size > 0) {
+    return model.size;
+  }
+
+  const sourceText = provider === "ollama"
+    ? [("parameterSize" in model ? model.parameterSize : undefined), model.name, "model" in model ? model.model : undefined].filter(Boolean).join(" ")
+    : [model.name, "id" in model ? model.id : undefined].filter(Boolean).join(" ");
+  const parameterBillions = parseParameterBillions(sourceText);
+  if (!parameterBillions) {
+    return null;
+  }
+
+  const normalizedSource = sourceText.toLowerCase();
+  const bytesPerBillion =
+    normalizedSource.includes("q2") ? 350_000_000
+      : normalizedSource.includes("q3") ? 450_000_000
+      : normalizedSource.includes("q4") ? 600_000_000
+      : normalizedSource.includes("q5") ? 750_000_000
+      : normalizedSource.includes("q6") ? 900_000_000
+      : normalizedSource.includes("q8") ? 1_100_000_000
+      : normalizedSource.includes("fp16") ? 2_100_000_000
+      : 700_000_000;
+
+  return Math.round(parameterBillions * bytesPerBillion);
+}
+
+function estimateKvCacheBytes(model: OllamaModelSummary | LmStudioModelSummary, requestedContextLength: number) {
+  const sourceText = "parameterSize" in model
+    ? [model.parameterSize, model.name, "model" in model ? model.model : undefined].filter(Boolean).join(" ")
+    : [model.name, "id" in model ? model.id : undefined].filter(Boolean).join(" ");
+  const parameterBillions = parseParameterBillions(sourceText);
+  if (!parameterBillions || requestedContextLength <= 0) {
+    return 0;
+  }
+
+  const familyFactor =
+    "family" in model && typeof model.family === "string" && model.family.toLowerCase().includes("moe")
+      ? 0.72
+      : sourceText.toLowerCase().includes("moe")
+        ? 0.72
+        : 1;
+
+  return Math.round(parameterBillions * requestedContextLength * 24_000 * familyFactor);
+}
+
+function findPreviousToolGroupId(messages: ChatMessage[], targetMessageId: string) {
+  const items = buildRenderItems(messages.filter(hasRenderableMessageContent));
+  const targetIndex = items.findIndex(
+    (item) => item.type === "message" && item.message.id === targetMessageId,
+  );
+
+  if (targetIndex <= 0) {
+    return null;
+  }
+
+  const previousItem = items[targetIndex - 1];
+  return previousItem?.type === "tool-group" ? previousItem.id : null;
 }
 
 function getFileName(pathValue: string) {
@@ -962,7 +1080,11 @@ const AnimatedMarkdown = memo(function AnimatedMarkdown({
 type OpenMenu = "attach" | "files" | "mode" | "model" | "thoroughness" | null;
 const GEMINI_API_KEY_STORAGE_KEY = "cogent.geminiApiKey";
 const MODEL_PROVIDER_STORAGE_KEY = "cogent.modelProvider";
+const GEMINI_MODEL_STORAGE_KEY = "cogent.geminiModel";
 const OLLAMA_MODEL_STORAGE_KEY = "cogent.ollamaModel";
+const OLLAMA_CONTEXT_LENGTH_STORAGE_KEY = "cogent.ollamaContextLength";
+const LMSTUDIO_MODEL_STORAGE_KEY = "cogent.lmstudioModel";
+const LMSTUDIO_CONTEXT_LENGTH_STORAGE_KEY = "cogent.lmstudioContextLength";
 const AUTO_COLLAPSE_TOOL_GROUPS_STORAGE_KEY = "cogent.autoCollapseToolGroups";
 const CHAT_SESSIONS_STORAGE_KEY = "cogent.chatSessions";
 const ACTIVE_SESSION_STORAGE_KEY = "cogent.activeSessionId";
@@ -1001,6 +1123,7 @@ const COPY = {
     modelDescription: "Pick how fast or deep the agent should respond.",
     modelGeminiSection: "Gemini",
     modelOllamaSection: "Local Ollama",
+    modelLmStudioSection: "Local LM Studio",
     modelOllamaDescription: "Detected local models available through Ollama.",
     modeTitle: "Mode",
     modeDescription: "Match the agent to the kind of code you are shaping.",
@@ -1027,9 +1150,15 @@ const COPY = {
     settingsClose: "Close settings",
     settingsApiKeyLabel: "Gemini API Key",
     settingsApiKeyDescription: "Enter the API key used to call Gemini models.",
+    geminiApiKeyRequiredMessage: "Add your Gemini API key in Settings to use cloud models.",
     settingsOllamaLabel: "Local Ollama",
     settingsOllamaAvailable: "Detected and ready to use.",
     settingsOllamaUnavailable: "Not detected on this computer.",
+    settingsOllamaContextLengthLabel: "Ollama context length",
+    settingsOllamaContextLengthDescription: "Lower this to reduce memory usage. Example: 8192",
+    settingsLmStudioContextLengthLabel: "LM Studio context length",
+    settingsLmStudioContextLengthDescription: "Lower this to reduce memory usage. Example: 8192",
+    settingsAutomaticPlaceholder: "Calculates the maximum by considering available system headroom.",
     settingsAutoCollapseLabel: "Auto-collapse tool cards",
     settingsAutoCollapseDescription: "Collapse diff and command groups automatically when they appear.",
     settingsGlobalSystemPromptLabel: "Global system prompt",
@@ -1037,6 +1166,10 @@ const COPY = {
     settingsResetAppLabel: "Reset app",
     settingsResetAppDescription: "Clear sessions and local settings, then return the app to its initial state.",
     settingsResetAppAction: "Reset app",
+    modelWarningTitle: "This model may fail to load",
+    modelWarningDescription: "The current local model settings look heavy for this system. It may fail to load or become unstable.",
+    modelWarningConfirm: "Select anyway",
+    modelWarningMenu: "May fail to load",
     resetWarningTitle: "Reset this app?",
     resetWarningDescription: "This clears saved sessions and local app settings. Project files and the open workspace stay untouched.",
     resetWarningConfirm: "Reset",
@@ -1097,6 +1230,7 @@ const COPY = {
     modelDescription: "에이전트의 응답 속도와 추론 깊이를 고릅니다.",
     modelGeminiSection: "Gemini",
     modelOllamaSection: "로컬 Ollama",
+    modelLmStudioSection: "로컬 LM Studio",
     modelOllamaDescription: "이 컴퓨터에서 감지된 로컬 모델입니다.",
     modeTitle: "모드",
     modeDescription: "현재 다루는 코드 성격에 맞게 에이전트를 맞춥니다.",
@@ -1123,9 +1257,15 @@ const COPY = {
     settingsClose: "설정 닫기",
     settingsApiKeyLabel: "Gemini API Key",
     settingsApiKeyDescription: "Gemini 모델 호출에 사용할 API Key를 입력합니다.",
+    geminiApiKeyRequiredMessage: "클라우드 모델을 쓰려면 설정에서 Gemini API Key를 입력해 주세요.",
     settingsOllamaLabel: "로컬 Ollama",
     settingsOllamaAvailable: "감지되었고 바로 사용할 수 있습니다.",
     settingsOllamaUnavailable: "이 컴퓨터에서 감지되지 않았습니다.",
+    settingsOllamaContextLengthLabel: "Ollama 컨텍스트 길이",
+    settingsOllamaContextLengthDescription: "메모리를 줄이려면 이 값을 낮추세요. 예: 8192",
+    settingsLmStudioContextLengthLabel: "LM Studio 컨텍스트 길이",
+    settingsLmStudioContextLengthDescription: "메모리를 줄이려면 이 값을 낮추세요. 예: 8192",
+    settingsAutomaticPlaceholder: "시스템의 여유분을 고려하여 최대값을 계산합니다.",
     settingsAutoCollapseLabel: "도구 카드 자동 접기",
     settingsAutoCollapseDescription: "diff와 명령어 그룹이 생길 때 자동으로 접습니다.",
     settingsGlobalSystemPromptLabel: "전역 시스템 프롬프트",
@@ -1133,6 +1273,10 @@ const COPY = {
     settingsResetAppLabel: "앱 초기화",
     settingsResetAppDescription: "저장된 세션과 로컬 설정을 지우고 앱 상태를 처음처럼 되돌립니다.",
     settingsResetAppAction: "앱 초기화",
+    modelWarningTitle: "이 모델은 로드에 실패할 수 있습니다",
+    modelWarningDescription: "현재 로컬 모델 설정이 이 시스템 사양에 비해 무거워 보입니다. 로드에 실패하거나 불안정할 수 있습니다.",
+    modelWarningConfirm: "그래도 선택",
+    modelWarningMenu: "로드 실패 가능성",
     resetWarningTitle: "앱을 초기화할까요?",
     resetWarningDescription: "저장된 세션과 로컬 설정이 삭제됩니다. 프로젝트 파일과 현재 워크스페이스는 건드리지 않습니다.",
     resetWarningConfirm: "초기화",
@@ -1148,7 +1292,7 @@ const COPY = {
     contextUsageTitle: (percent: number) => `컨텍스트 창: ${percent}%`,
     contextState: "상태",
     contextSnippets: "스니펫",
-    contextEstimate: "개의 토큰 사용",
+    contextEstimate: " 개의 토큰 사용",
     toolGroupDiffSingle: "파일 수정",
     toolGroupDiffMulti: (count: number) => `파일 수정 ${count}개`,
     toolGroupCommandSingle: "명령어 실행",
@@ -1193,6 +1337,7 @@ const COPY = {
     modelDescription: "エ?ジェントの?答速度と推論の深さを選びます。",
     modelGeminiSection: "Gemini",
     modelOllamaSection: "ロ?カル Ollama",
+    modelLmStudioSection: "ローカル LM Studio",
     modelOllamaDescription: "この端末で?出されたロ?カルモデルです。",
     modeTitle: "モ?ド",
     modeDescription: "扱っているコ?ドの種類に合わせてエ?ジェントを調整します。",
@@ -1219,9 +1364,15 @@ const COPY = {
     settingsClose: "設定を閉じる",
     settingsApiKeyLabel: "Gemini API Key",
     settingsApiKeyDescription: "Gemini モデルの呼び出しに使う API Key を入力します。",
+    geminiApiKeyRequiredMessage: "クラウドモデルを使うには設定で Gemini API Key を入力してください。",
     settingsOllamaLabel: "ロ?カル Ollama",
     settingsOllamaAvailable: "?出?みで、そのまま使えます。",
     settingsOllamaUnavailable: "この端末では?出されませんでした。",
+    settingsOllamaContextLengthLabel: "Ollama コンテキスト長",
+    settingsOllamaContextLengthDescription: "メモリ使用量を減らすにはこの値を下げます。例: 8192",
+    settingsLmStudioContextLengthLabel: "LM Studio コンテキスト長",
+    settingsLmStudioContextLengthDescription: "メモリ使用量を減らすにはこの値を下げます。例: 8192",
+    settingsAutomaticPlaceholder: "システムの余裕分を考慮して最大値を計算します。",
     settingsAutoCollapseLabel: "ツ?ルカ?ドを自動で折りたたむ",
     settingsAutoCollapseDescription: "diff とコマンドのグル?プを生成時に自動で折りたたみます。",
     settingsGlobalSystemPromptLabel: "グロ?バルシステムプロンプト",
@@ -1229,6 +1380,10 @@ const COPY = {
     settingsResetAppLabel: "アプリを初期化",
     settingsResetAppDescription: "保存?みセッションとロ?カル設定を消去し、アプリ?態を初期?態に?します。",
     settingsResetAppAction: "アプリを初期化",
+    modelWarningTitle: "このモデルはロードに失敗する可能性があります",
+    modelWarningDescription: "現在のローカルモデル設定はこのシステムに対して重すぎる可能性があります。ロード失敗や不安定化の恐れがあります。",
+    modelWarningConfirm: "それでも選択",
+    modelWarningMenu: "ロード失敗の可能性",
     resetWarningTitle: "アプリを初期化しますか?",
     resetWarningDescription: "保存?みセッションとロ?カル設定が削除されます。プロジェクトファイルと現在のワ?クスペ?スは?更しません。",
     resetWarningConfirm: "初期化",
@@ -1286,6 +1441,8 @@ declare global {
         prompt: string;
         currentPromptImages?: ImageAttachment[];
         currentPromptFiles?: FileAttachment[];
+        ollamaContextLength?: number;
+        lmStudioContextLength?: number;
         activeFile?: string;
         selectedText?: string;
         openFiles: string[];
@@ -1304,6 +1461,8 @@ declare global {
           prompt: string;
           currentPromptImages?: ImageAttachment[];
           currentPromptFiles?: FileAttachment[];
+          ollamaContextLength?: number;
+          lmStudioContextLength?: number;
           activeFile?: string;
           selectedText?: string;
           openFiles: string[];
@@ -1324,6 +1483,8 @@ declare global {
       cancelBrowserAssist: (requestId: string) => Promise<{ canceled: boolean }>;
       buildContextSnapshot: (request: {
         prompt: string;
+        ollamaContextLength?: number;
+        lmStudioContextLength?: number;
         activeFile?: string;
         selectedText?: string;
         openFiles: string[];
@@ -1337,6 +1498,8 @@ declare global {
       }) => Promise<ContextSnapshot>;
       buildContextUsageSnapshot: (request: {
         prompt: string;
+        ollamaContextLength?: number;
+        lmStudioContextLength?: number;
         activeFile?: string;
         selectedText?: string;
         openFiles: string[];
@@ -1351,7 +1514,11 @@ declare global {
         workspaceRoot?: string;
       }) => Promise<ContextUsageSnapshot | null>;
       runCommand: (request: { command: string; cwd?: string }) => Promise<AgentStreamEvent[]>;
+      getMemoryInfo: () => Promise<{ totalMemoryBytes: number; freeMemoryBytes: number }>;
+      getGeminiModels: (apiKey: string) => Promise<{ available: boolean; models: GeminiModelSummary[]; error?: string }>;
       getOllamaModels: () => Promise<{ available: boolean; models: OllamaModelSummary[]; error?: string }>;
+      getLmStudioModels: () => Promise<{ available: boolean; models: LmStudioModelSummary[]; error?: string }>;
+      cleanupLocalModels: (payload: { provider?: ModelProvider; modelId?: string }) => Promise<{ cleaned: boolean }>;
       getWorkspaceInfo: () => Promise<{ rootPath: string; name: string }>;
       openFolder: () => Promise<{ rootPath: string; name: string } | null>;
       openPath: (targetPath: string) => Promise<OpenPathResult>;
@@ -1499,9 +1666,16 @@ export function App() {
   const [modeLocked, setModeLocked] = useState(false);
   const [modelTier, setModelTier] = useState<ModelTier>("flash");
   const [modelProvider, setModelProvider] = useState<ModelProvider>("gemini");
+  const [selectedGeminiModel, setSelectedGeminiModel] = useState("");
+  const [geminiModels, setGeminiModels] = useState<GeminiModelSummary[]>([]);
   const [selectedOllamaModel, setSelectedOllamaModel] = useState("");
+  const [ollamaContextLength, setOllamaContextLength] = useState("");
+  const [ollamaContextLengthDraft, setOllamaContextLengthDraft] = useState("");
+  const [selectedLmStudioModel, setSelectedLmStudioModel] = useState("");
   const [ollamaModels, setOllamaModels] = useState<OllamaModelSummary[]>([]);
   const [isOllamaAvailable, setIsOllamaAvailable] = useState(false);
+  const [lmStudioModels, setLmStudioModels] = useState<LmStudioModelSummary[]>([]);
+  const [isLmStudioAvailable, setIsLmStudioAvailable] = useState(false);
   const [thoroughness, setThoroughness] = useState<Thoroughness>("balanced");
   const [openMenu, setOpenMenu] = useState<OpenMenu>(null);
   const [closingMenu, setClosingMenu] = useState<OpenMenu>(null);
@@ -1510,17 +1684,23 @@ export function App() {
   const [isSettingsVisible, setIsSettingsVisible] = useState(false);
   const [isResetWarningOpen, setIsResetWarningOpen] = useState(false);
   const [isResetWarningVisible, setIsResetWarningVisible] = useState(false);
+  const [modelSelectionWarning, setModelSelectionWarning] = useState<PendingModelSelectionWarning | null>(null);
+  const [isModelSelectionWarningVisible, setIsModelSelectionWarningVisible] = useState(false);
   const [autoCollapseToolGroups, setAutoCollapseToolGroups] = useState(true);
   const [autoCollapseToolGroupsDraft, setAutoCollapseToolGroupsDraft] = useState(true);
   const [globalSystemPrompt, setGlobalSystemPrompt] = useState("");
   const [globalSystemPromptDraft, setGlobalSystemPromptDraft] = useState("");
+  const [lmStudioContextLength, setLmStudioContextLength] = useState("");
+  const [lmStudioContextLengthDraft, setLmStudioContextLengthDraft] = useState("");
   const [draftPromptImagesBySession, setDraftPromptImagesBySession] = useState<Record<string, ImageAttachment[]>>({});
   const [draftPromptFilesBySession, setDraftPromptFilesBySession] = useState<Record<string, FileAttachment[]>>({});
   const [isContextUsageTooltipOpen, setIsContextUsageTooltipOpen] = useState(false);
   const [isContextUsageTooltipVisible, setIsContextUsageTooltipVisible] = useState(false);
   const [contextUsageTooltipPosition, setContextUsageTooltipPosition] = useState<{ left: number; top: number } | null>(null);
+  const [systemTotalMemoryBytes, setSystemTotalMemoryBytes] = useState<number | undefined>(undefined);
+  const [systemFreeMemoryBytes, setSystemFreeMemoryBytes] = useState<number | undefined>(undefined);
   const [locale] = useState<Locale>(detectLocale);
-  const [menuPosition, setMenuPosition] = useState<{ left: number; top: number; minWidth: number } | null>(null);
+  const [menuPosition, setMenuPosition] = useState<{ left: number; top: number; minWidth: number; maxHeight: number } | null>(null);
   const [detectedMode, setDetectedMode] = useState<AgentMode | null>(null);
   const [windowMaximized, setWindowMaximized] = useState(false);
   const [workspaceName, setWorkspaceName] = useState("");
@@ -1606,6 +1786,7 @@ export function App() {
   const activeStreamCompletedRef = useRef<Promise<void> | null>(null);
   const manualFileSelectionVersionRef = useRef(0);
   const didInitializeCollapsedToolGroupsRef = useRef(false);
+  const didInitializeLocalModelCleanupRef = useRef(false);
   const editingTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const triggerRefs = useRef<Record<Exclude<OpenMenu, null>, HTMLButtonElement | null>>({
     attach: null,
@@ -1623,23 +1804,42 @@ export function App() {
   const renderItems = useMemo(() => buildRenderItems(renderableMessages), [renderableMessages]);
   const context = activeSession?.context ?? null;
   const contextUsage = activeSession?.contextUsage ?? null;
+  const selectedGeminiModelSummary = geminiModels.find((model) => model.id === selectedGeminiModel);
   const selectedOllamaModelSummary = ollamaModels.find(
     (model) => model.model === selectedOllamaModel || model.name === selectedOllamaModel,
   );
+  const selectedLmStudioModelSummary = lmStudioModels.find((model) => model.id === selectedLmStudioModel);
   const activeModelLabel =
-    modelProvider === "ollama"
+    modelProvider === "gemini"
+      ? (selectedGeminiModelSummary?.name ?? (modelTier === "pro" ? "Pro" : modelTier === "flash" ? "Flash" : "Flash Lite"))
+      : modelProvider === "ollama"
       ? (selectedOllamaModelSummary?.name ?? selectedOllamaModel ?? "Ollama")
-      : modelTier === "pro"
-        ? "Pro"
+      : modelProvider === "lmstudio"
+        ? (selectedLmStudioModelSummary?.name ?? selectedLmStudioModel ?? "LM Studio")
+        : modelTier === "pro"
+          ? "Pro"
         : modelTier === "flash"
           ? "Flash"
           : "Flash Lite";
   const canSend = prompt.trim().length > 0 || promptImages.length > 0 || promptFiles.length > 0;
-  const contextUsageDisplay = contextUsage ?? {
+  const currentInputTokenLimit =
+    modelProvider === "gemini"
+      ? (selectedGeminiModelSummary?.inputTokenLimit || MODEL_INPUT_TOKEN_LIMITS[modelTier])
+      : modelProvider === "ollama"
+      ? (Number(ollamaContextLength) || Number(getDefaultOllamaContextLength(systemTotalMemoryBytes)) || selectedOllamaModelSummary?.contextLength || 131_072)
+      : modelProvider === "lmstudio"
+        ? (Number(lmStudioContextLength) || Number(getDefaultLmStudioContextLength(systemTotalMemoryBytes)) || selectedLmStudioModelSummary?.contextLength || 32_768)
+        : MODEL_INPUT_TOKEN_LIMITS[modelTier];
+  const contextUsageDisplay = contextUsage
+    ? {
+        ...contextUsage,
+        inputTokenLimit: currentInputTokenLimit,
+        usagePercent: Math.max(0, Math.min(100, Math.round((contextUsage.usedTokens / currentInputTokenLimit) * 100))),
+      }
+    : {
     model: activeModelLabel,
     usedTokens: 0,
-    inputTokenLimit:
-      modelProvider === "ollama" ? (selectedOllamaModelSummary?.contextLength ?? 131_072) : MODEL_INPUT_TOKEN_LIMITS[modelTier],
+    inputTokenLimit: currentInputTokenLimit,
     usagePercent: 0,
     compressionState: context?.retrieval.compressionState ?? "healthy",
     snippetCount: context?.retrieval.snippets.length ?? 0,
@@ -1698,6 +1898,8 @@ export function App() {
   function buildTaskRequest(submittedPrompt: string, conversation: ConversationTurn[]): {
     prompt: string;
     globalSystemPrompt?: string;
+    ollamaContextLength?: number;
+    lmStudioContextLength?: number;
     currentPromptImages?: ImageAttachment[];
     currentPromptFiles?: FileAttachment[];
     activeFile?: string;
@@ -1717,6 +1919,8 @@ export function App() {
     return {
       prompt: submittedPrompt,
       globalSystemPrompt: globalSystemPrompt.trim() || undefined,
+      ollamaContextLength: modelProvider === "ollama" ? Number(ollamaContextLength) || undefined : undefined,
+      lmStudioContextLength: modelProvider === "lmstudio" ? Number(lmStudioContextLength) || undefined : undefined,
       currentPromptImages: promptImages.length > 0 ? promptImages : undefined,
       currentPromptFiles: promptFiles.length > 0 ? promptFiles : undefined,
       activeFile: activeFilePath,
@@ -1724,7 +1928,14 @@ export function App() {
       explicitMode: modeLocked && mode !== "auto" ? mode : undefined,
       modelTier,
       modelProvider,
-      modelId: modelProvider === "ollama" ? selectedOllamaModel || undefined : undefined,
+      modelId:
+        modelProvider === "gemini"
+          ? selectedGeminiModel || undefined
+          : modelProvider === "ollama"
+          ? selectedOllamaModel || undefined
+          : modelProvider === "lmstudio"
+            ? selectedLmStudioModel || undefined
+            : undefined,
       liveApply: true,
       currentCode: code,
       apiKey: modelProvider === "gemini" ? geminiApiKey : undefined,
@@ -1863,6 +2074,19 @@ export function App() {
     composerFileInputRef.current?.click();
   }
 
+  function handleAssistantLink(url: string) {
+    if (url === "cogent://settings") {
+      handleOpenSettings();
+      return;
+    }
+
+    handleOpenBrowserPanelLink(url);
+  }
+
+  function preventMouseFocus(event: React.MouseEvent<HTMLElement> | React.PointerEvent<HTMLElement>) {
+    event.preventDefault();
+  }
+
   async function handleComposerFileInputChange(event: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files ?? []);
     if (files.length > 0) {
@@ -1879,6 +2103,22 @@ export function App() {
 
     setEditingMessageId(message.id);
     setEditingMessageText(message.text);
+  }
+
+  function appendGeminiApiKeyFallbackMessage(sessionId: string) {
+    updateSessionById(sessionId, (session) => ({
+      ...session,
+      messages: [
+        ...session.messages,
+        {
+          id: `${Date.now()}-assistant-api-key`,
+          role: "assistant",
+          text: text.geminiApiKeyRequiredMessage,
+        },
+      ],
+    }));
+    shouldFollowChatRef.current = true;
+    pendingScrollBehaviorRef.current = "smooth";
   }
 
   function handleCancelMessageEdit() {
@@ -1952,6 +2192,22 @@ export function App() {
 
     const submittedPrompt = editingMessageText.trim();
     if (!submittedPrompt) {
+      return;
+    }
+
+    if (modelProvider === "gemini" && !geminiApiKey.trim()) {
+      const baseMessages = messages.slice(0, targetIndex);
+      const editedUserMessage: ChatMessage = {
+        ...messages[targetIndex],
+        text: submittedPrompt,
+      };
+
+      updateSessionById(currentSessionId, (session) => ({
+        ...session,
+        messages: [...baseMessages, editedUserMessage],
+      }));
+      handleCancelMessageEdit();
+      appendGeminiApiKeyFallbackMessage(currentSessionId);
       return;
     }
 
@@ -2177,7 +2433,7 @@ export function App() {
             );
 
             if (autoCollapseToolGroups) {
-              toolGroupToCollapse = findLatestToolGroupId(nextMessages);
+              toolGroupToCollapse = findPreviousToolGroupId(nextMessages, activeTextMessageId);
             }
 
             return {
@@ -2452,6 +2708,7 @@ export function App() {
     modelTier,
     modelProvider,
     selectedOllamaModel,
+    ollamaContextLength,
     geminiApiKey,
     prompt,
     messages,
@@ -2663,16 +2920,23 @@ export function App() {
       const rect = trigger.getBoundingClientRect();
       const estimatedMenuWidth = 220;
       const viewportPadding = 12;
+      const titlebarHeight = 40;
+      const verticalOffset = activeMenu === "files" ? 10 : 10;
       const left = Math.min(
         Math.max(viewportPadding, rect.left),
         window.innerWidth - estimatedMenuWidth - viewportPadding,
       );
-      const top = Math.max(viewportPadding, activeMenu === "files" ? rect.bottom : rect.top);
+      const top = Math.max(titlebarHeight + viewportPadding, activeMenu === "files" ? rect.bottom : rect.top);
+      const availableHeight =
+        activeMenu === "files"
+          ? window.innerHeight - rect.bottom - viewportPadding - verticalOffset
+          : rect.top - (titlebarHeight + viewportPadding) - verticalOffset;
 
       setMenuPosition({
         left,
         top,
         minWidth: rect.width,
+        maxHeight: Math.max(180, Math.floor(availableHeight)),
       });
     };
 
@@ -2753,6 +3017,9 @@ export function App() {
   useEffect(() => {
     if (openMenu) {
       setMenuVisible(false);
+      if (document.activeElement === textareaRef.current) {
+        textareaRef.current?.blur();
+      }
       const frame = window.requestAnimationFrame(() => {
         setMenuVisible(true);
       });
@@ -2770,7 +3037,11 @@ export function App() {
 
     const savedKey = window.localStorage.getItem(GEMINI_API_KEY_STORAGE_KEY) ?? "";
     const savedProvider = window.localStorage.getItem(MODEL_PROVIDER_STORAGE_KEY);
+    const savedGeminiModel = window.localStorage.getItem(GEMINI_MODEL_STORAGE_KEY) ?? "";
     const savedOllamaModel = window.localStorage.getItem(OLLAMA_MODEL_STORAGE_KEY) ?? "";
+    const savedOllamaContextLength = window.localStorage.getItem(OLLAMA_CONTEXT_LENGTH_STORAGE_KEY) ?? "";
+    const savedLmStudioModel = window.localStorage.getItem(LMSTUDIO_MODEL_STORAGE_KEY) ?? "";
+    const savedLmStudioContextLength = window.localStorage.getItem(LMSTUDIO_CONTEXT_LENGTH_STORAGE_KEY);
     const rawAutoCollapseToolGroups = window.localStorage.getItem(AUTO_COLLAPSE_TOOL_GROUPS_STORAGE_KEY);
     const savedGlobalSystemPrompt = window.localStorage.getItem(GLOBAL_SYSTEM_PROMPT_STORAGE_KEY) ?? "";
     const savedAutoCollapseToolGroups = rawAutoCollapseToolGroups === null ? true : rawAutoCollapseToolGroups === "true";
@@ -2778,12 +3049,39 @@ export function App() {
     setGeminiApiKeyDraft(savedKey);
     setGlobalSystemPrompt(savedGlobalSystemPrompt);
     setGlobalSystemPromptDraft(savedGlobalSystemPrompt);
+    setOllamaContextLength(savedOllamaContextLength);
+    setOllamaContextLengthDraft(savedOllamaContextLength);
+    setLmStudioContextLength(savedLmStudioContextLength ?? "");
+    setLmStudioContextLengthDraft(savedLmStudioContextLength ?? "");
     setAutoCollapseToolGroups(savedAutoCollapseToolGroups);
     setAutoCollapseToolGroupsDraft(savedAutoCollapseToolGroups);
-    if (savedProvider === "gemini" || savedProvider === "ollama") {
+    if (savedProvider === "gemini" || savedProvider === "ollama" || savedProvider === "lmstudio") {
       setModelProvider(savedProvider);
     }
+    setSelectedGeminiModel(savedGeminiModel);
     setSelectedOllamaModel(savedOllamaModel);
+    setSelectedLmStudioModel(savedLmStudioModel);
+  }, []);
+
+  useEffect(() => {
+    const cogent = getCogent();
+    if (!cogent || typeof window === "undefined") {
+      return;
+    }
+
+    let cancelled = false;
+    void cogent.getMemoryInfo().then((info) => {
+      if (cancelled) {
+        return;
+      }
+
+      setSystemTotalMemoryBytes(info.totalMemoryBytes);
+      setSystemFreeMemoryBytes(info.freeMemoryBytes);
+    });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -2824,6 +3122,79 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    const cogent = getCogent();
+    if (!cogent) {
+      return;
+    }
+
+    let cancelled = false;
+    void cogent.getLmStudioModels().then((result) => {
+      if (cancelled) {
+        return;
+      }
+
+      setIsLmStudioAvailable(result.available);
+      setLmStudioModels(result.models);
+
+      if (result.models.length === 0) {
+        if (modelProvider === "lmstudio") {
+          setModelProvider("gemini");
+        }
+        setSelectedLmStudioModel("");
+        return;
+      }
+
+      const hasCurrentSelection = result.models.some((model) => model.id === selectedLmStudioModel);
+      if (!hasCurrentSelection) {
+        setSelectedLmStudioModel(result.models[0].id);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const cogent = getCogent();
+    console.log("[Gemini models] effect fired", {
+      hasCogent: Boolean(cogent),
+      hasApiKey: Boolean(geminiApiKey.trim()),
+      apiKeyLength: geminiApiKey.trim().length,
+    });
+    if (!cogent || !geminiApiKey.trim()) {
+      console.log("[Gemini models] skipped fetch");
+      setGeminiModels([]);
+      return;
+    }
+
+    let cancelled = false;
+    console.log("[Gemini models] invoking preload bridge");
+    void cogent.getGeminiModels(geminiApiKey).then((result) => {
+      if (cancelled) {
+        return;
+      }
+
+      if (result.error) {
+        console.error("[Gemini models] Failed to fetch model list:", result.error);
+      }
+
+      console.log("[Gemini models] available:", result.available, "count:", result.models.length);
+
+      setGeminiModels(result.models);
+      if (result.models.length === 0) {
+        setSelectedGeminiModel("");
+        return;
+      }
+      setSelectedGeminiModel(result.models[0].id);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [geminiApiKey]);
+
+  useEffect(() => {
     if (isSettingsOpen) {
       setIsSettingsVisible(false);
       const frame = window.requestAnimationFrame(() => {
@@ -2852,12 +3223,38 @@ export function App() {
   }, [isResetWarningOpen]);
 
   useEffect(() => {
+    if (modelSelectionWarning) {
+      setIsModelSelectionWarningVisible(false);
+      const frame = window.requestAnimationFrame(() => {
+        setIsModelSelectionWarningVisible(true);
+      });
+
+      return () => window.cancelAnimationFrame(frame);
+    }
+
+    setIsModelSelectionWarningVisible(false);
+    return undefined;
+  }, [modelSelectionWarning]);
+
+  useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
 
     window.localStorage.setItem(MODEL_PROVIDER_STORAGE_KEY, modelProvider);
   }, [modelProvider]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    if (selectedGeminiModel) {
+      window.localStorage.setItem(GEMINI_MODEL_STORAGE_KEY, selectedGeminiModel);
+    } else {
+      window.localStorage.removeItem(GEMINI_MODEL_STORAGE_KEY);
+    }
+  }, [selectedGeminiModel]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -2876,6 +3273,62 @@ export function App() {
       return;
     }
 
+    if (ollamaContextLength) {
+      window.localStorage.setItem(OLLAMA_CONTEXT_LENGTH_STORAGE_KEY, ollamaContextLength);
+    } else {
+      window.localStorage.removeItem(OLLAMA_CONTEXT_LENGTH_STORAGE_KEY);
+    }
+  }, [ollamaContextLength]);
+
+  useEffect(() => {
+    const cogent = getCogent();
+    if (!cogent) {
+      return;
+    }
+
+    if (!didInitializeLocalModelCleanupRef.current) {
+      didInitializeLocalModelCleanupRef.current = true;
+      return;
+    }
+
+    const modelId =
+      modelProvider === "ollama"
+        ? selectedOllamaModel || undefined
+        : modelProvider === "lmstudio"
+          ? selectedLmStudioModel || undefined
+          : undefined;
+
+    void cogent.cleanupLocalModels({
+      provider: modelProvider,
+      modelId,
+    });
+  }, [modelProvider, selectedOllamaModel, selectedLmStudioModel]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    if (selectedLmStudioModel) {
+      window.localStorage.setItem(LMSTUDIO_MODEL_STORAGE_KEY, selectedLmStudioModel);
+    } else {
+      window.localStorage.removeItem(LMSTUDIO_MODEL_STORAGE_KEY);
+    }
+  }, [selectedLmStudioModel]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    window.localStorage.setItem(LMSTUDIO_CONTEXT_LENGTH_STORAGE_KEY, lmStudioContextLength);
+  }, [lmStudioContextLength]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
     window.localStorage.setItem(AUTO_COLLAPSE_TOOL_GROUPS_STORAGE_KEY, String(autoCollapseToolGroups));
   }, [autoCollapseToolGroups]);
 
@@ -2888,7 +3341,7 @@ export function App() {
       ...session,
       contextUsage: null,
     }));
-  }, [activeSession?.id, modelTier, modelProvider, selectedOllamaModel]);
+  }, [activeSession?.id, modelTier, modelProvider, selectedGeminiModel, selectedOllamaModel, ollamaContextLength, selectedLmStudioModel, lmStudioContextLength]);
 
   useEffect(() => {
     if (!isResizingFileRail) {
@@ -3064,6 +3517,12 @@ export function App() {
       return;
     }
 
+    if (modelProvider === "ollama") {
+      const ollamaResult = await cogent.getOllamaModels();
+      setIsOllamaAvailable(ollamaResult.available);
+      setOllamaModels(ollamaResult.models);
+    }
+
     const conversation = messages.map(toConversationTurn) satisfies ConversationTurn[];
     const taskRequest = buildTaskRequest(prompt, conversation);
     const snapshot = await cogent.buildContextSnapshot(taskRequest);
@@ -3075,6 +3534,34 @@ export function App() {
     const cogent = getCogent();
     const currentSessionId = activeSession?.id;
     if (!cogent || !canSend || !currentSessionId) {
+      return;
+    }
+
+    if (modelProvider === "gemini" && !geminiApiKey.trim()) {
+      const submittedPrompt = prompt.trim();
+      const submittedImages = promptImages;
+      const submittedFiles = promptFiles;
+      const nextSessionTitle = suggestSessionTitle(submittedPrompt, text);
+
+      updateSessionById(currentSessionId, (session) => ({
+        ...session,
+        name: session.titleState === "empty" ? nextSessionTitle : session.name,
+        titleState: session.titleState === "empty" ? "generated" : session.titleState,
+        prompt: "",
+        messages: [
+          ...session.messages,
+          {
+            id: `${Date.now()}-user`,
+            role: "user",
+            text: submittedPrompt,
+            attachments: submittedImages.length > 0 ? submittedImages : undefined,
+            fileAttachments: submittedFiles.length > 0 ? submittedFiles : undefined,
+          },
+        ],
+      }));
+      updateDraftImagesForSession(currentSessionId, () => []);
+      updateDraftFilesForSession(currentSessionId, () => []);
+      appendGeminiApiKeyFallbackMessage(currentSessionId);
       return;
     }
 
@@ -3309,7 +3796,7 @@ export function App() {
             );
 
             if (autoCollapseToolGroups) {
-              toolGroupToCollapse = findLatestToolGroupId(nextMessages);
+              toolGroupToCollapse = findPreviousToolGroupId(nextMessages, activeTextMessageId);
             }
 
             return {
@@ -3637,6 +4124,8 @@ export function App() {
     closeMenu();
     setGeminiApiKeyDraft(geminiApiKey);
     setGlobalSystemPromptDraft(globalSystemPrompt);
+    setOllamaContextLengthDraft(ollamaContextLength);
+    setLmStudioContextLengthDraft(lmStudioContextLength);
     setAutoCollapseToolGroupsDraft(autoCollapseToolGroups);
     setIsSettingsOpen(true);
   }
@@ -3659,6 +4148,102 @@ export function App() {
     }, 200);
   }
 
+  function handleCloseModelSelectionWarning() {
+    setIsModelSelectionWarningVisible(false);
+    window.setTimeout(() => {
+      setModelSelectionWarning(null);
+    }, 200);
+  }
+
+  function applyLocalModelSelection(provider: "ollama" | "lmstudio", modelId: string) {
+    setModelProvider(provider);
+    if (provider === "ollama") {
+      setSelectedOllamaModel(modelId);
+    } else {
+      setSelectedLmStudioModel(modelId);
+    }
+    closeMenu();
+  }
+
+  function getLocalModelWarningState(
+    provider: "ollama" | "lmstudio",
+    model: OllamaModelSummary | LmStudioModelSummary,
+  ) {
+    const automaticContextLength = Number(getDefaultLmStudioContextLength(systemTotalMemoryBytes));
+    const requestedContextLength =
+      provider === "ollama"
+        ? Number(ollamaContextLength) || automaticContextLength
+        : Number(lmStudioContextLength) || automaticContextLength;
+    const freeMemoryBytes = systemFreeMemoryBytes ?? 0;
+    const usableMemoryBytes = freeMemoryBytes > 0 ? Math.max(2 * 1024 * 1024 * 1024, freeMemoryBytes * 0.8) : 0;
+    const weightBytes = estimateModelWeightBytes(provider, model);
+    const kvCacheBytes = estimateKvCacheBytes(model, requestedContextLength);
+    const runtimeOverheadBytes = 1_500_000_000;
+    const fragmentationBytes = weightBytes !== null ? Math.round(weightBytes * 0.12) : 0;
+    const backendPeakBytes = weightBytes !== null ? Math.round(weightBytes * 0.08) : 0;
+    const estimatedRequiredBytes =
+      (weightBytes ?? 0) +
+      kvCacheBytes +
+      runtimeOverheadBytes +
+      fragmentationBytes +
+      backendPeakBytes;
+    const isContextTooLarge = automaticContextLength > 0 && requestedContextLength > automaticContextLength * 1.1;
+    const exceedsUsableMemory = usableMemoryBytes > 0 && estimatedRequiredBytes > usableMemoryBytes;
+    const isUnknownHeavyModel =
+      weightBytes === null &&
+      requestedContextLength >= 8192 &&
+      ((provider === "lmstudio" && /(?:30|32|34|35|40|70)b/i.test(`${model.name} ${"id" in model ? model.id : ""}`)) ||
+        (provider === "ollama" && /(?:30|32|34|35|40|70)b/i.test(`${model.name} ${"model" in model ? model.model : ""}`)));
+    return isContextTooLarge || exceedsUsableMemory || isUnknownHeavyModel;
+  }
+
+  function maybeWarnForLocalModelSelection(
+    provider: "ollama" | "lmstudio",
+    modelId: string,
+    model: OllamaModelSummary | LmStudioModelSummary,
+  ) {
+    if (getLocalModelWarningState(provider, model)) {
+      setModelSelectionWarning({
+        provider,
+        modelId,
+        title: text.modelWarningTitle,
+        description: text.modelWarningDescription,
+      });
+      closeMenu();
+      return;
+    }
+
+    applyLocalModelSelection(provider, modelId);
+  }
+
+  function normalizeLmStudioContextLengthInput(value: string) {
+    const normalized = value.trim();
+    if (!normalized) {
+      return "";
+    }
+
+    const numericValue = Number(normalized);
+    if (!Number.isFinite(numericValue)) {
+      return "";
+    }
+
+    return String(Math.max(1024, Math.round(numericValue)));
+  }
+
+  function normalizeOllamaContextLengthInput(value: string) {
+    const normalized = value.trim();
+    if (!normalized) {
+      return "";
+    }
+
+    const numericValue = Number(normalized);
+    if (!Number.isFinite(numericValue)) {
+      return "";
+    }
+
+    return String(Math.max(1024, Math.round(numericValue)));
+  }
+
   async function handleConfirmResetApp() {
     if (isAgentRunning) {
       await cancelCurrentAgentRun();
@@ -3675,7 +4260,11 @@ export function App() {
     if (typeof window !== "undefined") {
       window.localStorage.removeItem(GEMINI_API_KEY_STORAGE_KEY);
       window.localStorage.removeItem(MODEL_PROVIDER_STORAGE_KEY);
+      window.localStorage.removeItem(GEMINI_MODEL_STORAGE_KEY);
       window.localStorage.removeItem(OLLAMA_MODEL_STORAGE_KEY);
+      window.localStorage.removeItem(OLLAMA_CONTEXT_LENGTH_STORAGE_KEY);
+      window.localStorage.removeItem(LMSTUDIO_MODEL_STORAGE_KEY);
+      window.localStorage.removeItem(LMSTUDIO_CONTEXT_LENGTH_STORAGE_KEY);
       window.localStorage.removeItem(AUTO_COLLAPSE_TOOL_GROUPS_STORAGE_KEY);
       window.localStorage.removeItem(CHAT_SESSIONS_STORAGE_KEY);
       window.localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
@@ -3704,7 +4293,13 @@ export function App() {
     setGlobalSystemPrompt("");
     setGlobalSystemPromptDraft("");
     setModelProvider("gemini");
+    setSelectedGeminiModel("");
     setSelectedOllamaModel("");
+    setOllamaContextLength("");
+    setOllamaContextLengthDraft("");
+    setSelectedLmStudioModel("");
+    setLmStudioContextLength("");
+    setLmStudioContextLengthDraft("");
     setAutoCollapseToolGroups(true);
     setAutoCollapseToolGroupsDraft(true);
     setMode("auto");
@@ -3730,8 +4325,14 @@ export function App() {
   function handleSaveSettings() {
     const normalizedKey = geminiApiKeyDraft.trim();
     const normalizedGlobalSystemPrompt = globalSystemPromptDraft.trim();
+    const normalizedOllamaContextLength = normalizeOllamaContextLengthInput(ollamaContextLengthDraft);
+    const normalizedLmStudioContextLength = normalizeLmStudioContextLengthInput(lmStudioContextLengthDraft);
     setGeminiApiKey(normalizedKey);
     setGlobalSystemPrompt(normalizedGlobalSystemPrompt);
+    setOllamaContextLength(normalizedOllamaContextLength);
+    setOllamaContextLengthDraft(normalizedOllamaContextLength);
+    setLmStudioContextLength(normalizedLmStudioContextLength);
+    setLmStudioContextLengthDraft(normalizedLmStudioContextLength);
     setAutoCollapseToolGroups(autoCollapseToolGroupsDraft);
     if (typeof window !== "undefined") {
       if (normalizedKey) {
@@ -3743,6 +4344,16 @@ export function App() {
         window.localStorage.setItem(GLOBAL_SYSTEM_PROMPT_STORAGE_KEY, normalizedGlobalSystemPrompt);
       } else {
         window.localStorage.removeItem(GLOBAL_SYSTEM_PROMPT_STORAGE_KEY);
+      }
+      if (normalizedOllamaContextLength) {
+        window.localStorage.setItem(OLLAMA_CONTEXT_LENGTH_STORAGE_KEY, normalizedOllamaContextLength);
+      } else {
+        window.localStorage.removeItem(OLLAMA_CONTEXT_LENGTH_STORAGE_KEY);
+      }
+      if (normalizedLmStudioContextLength) {
+        window.localStorage.setItem(LMSTUDIO_CONTEXT_LENGTH_STORAGE_KEY, normalizedLmStudioContextLength);
+      } else {
+        window.localStorage.removeItem(LMSTUDIO_CONTEXT_LENGTH_STORAGE_KEY);
       }
     }
     handleCloseSettings();
@@ -4143,60 +4754,104 @@ export function App() {
             <strong>{text.modelTitle}</strong>
             <p>{text.modelDescription}</p>
           </div>
-          <div className="menu-section-label">{text.modelGeminiSection}</div>
-          <button
-            className={modelProvider === "gemini" && modelTier === "flash-lite" ? "menu-item active" : "menu-item"}
-              onClick={() => {
-               setModelProvider("gemini");
-               setModelTier("flash-lite");
-                closeMenu();
-              }}
-          >
-            <span className="menu-item-title">Flash Lite</span>
-            <span className="menu-item-description">{text.modelFlashLiteDescription}</span>
-          </button>
-          <button
-            className={modelProvider === "gemini" && modelTier === "flash" ? "menu-item active" : "menu-item"}
-              onClick={() => {
-               setModelProvider("gemini");
-               setModelTier("flash");
-                closeMenu();
-              }}
-          >
-            <span className="menu-item-title">Flash</span>
-            <span className="menu-item-description">{text.modelFlashDescription}</span>
-          </button>
-          <button
-            className={modelProvider === "gemini" && modelTier === "pro" ? "menu-item active" : "menu-item"}
-              onClick={() => {
-               setModelProvider("gemini");
-               setModelTier("pro");
-                closeMenu();
-              }}
-          >
-            <span className="menu-item-title">Pro</span>
-            <span className="menu-item-description">{text.modelProDescription}</span>
-          </button>
+          {geminiModels.length > 0 ? (
+            <>
+              <div className="menu-section-label">{text.modelGeminiSection}</div>
+              {geminiModels.map((model) => (
+                <button
+                  key={model.id}
+                  className={modelProvider === "gemini" && selectedGeminiModel === model.id ? "menu-item active" : "menu-item"}
+                  onClick={() => {
+                    setModelProvider("gemini");
+                    setSelectedGeminiModel(model.id);
+                    closeMenu();
+                  }}
+                >
+                  <span className="menu-item-title-row">
+                    <span className="menu-item-title">{model.name}</span>
+                    <span className="menu-item-cloud-icon" aria-hidden="true">
+                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 24"><path d="M15.496 0C10 .013 5.334 3.822 3.994 9.088A7.996 7.996 0 0 0 0 16c0 4.37 3.455 8 7.75 8H24.5c4.124 0 7.5-3.376 7.5-7.5 0-3.138-2.012-5.832-4.889-6.924C25.952 4.083 21.2.002 15.5 0h-.002Zm.004 3h.004a8.981 8.981 0 0 1 8.92 7.86l.13 1.025 1.005.242A4.488 4.488 0 0 1 29 16.5c0 2.503-1.997 4.5-4.5 4.5H7.75C5.141 21 3 18.81 3 16c.001-1.972 1.101-3.731 2.768-4.537a4.816 4.816 0 0 1 2.275-.086c1.246.262 2.631.94 3.516 4.035a1.5 1.5 0 0 0 1.853 1.03 1.5 1.5 0 0 0 1.03-1.854c-1.116-3.906-3.63-5.693-5.782-6.147a7.402 7.402 0 0 0-1.33-.152A8.98 8.98 0 0 1 15.5 3Z"/></svg>
+                    </span>
+                  </span>
+                  <span className="menu-item-description">
+                    {getGeminiMenuDescription(model, locale)}
+                  </span>
+                </button>
+              ))}
+            </>
+          ) : null}
           {isOllamaAvailable && ollamaModels.length > 0 ? (
             <>
               <div className="menu-section-label">{text.modelOllamaSection}</div>
               {ollamaModels.map((model) => (
-                <button
-                  key={model.model}
-                  className={modelProvider === "ollama" && selectedOllamaModel === model.model ? "menu-item active" : "menu-item"}
-                  onClick={() => {
-                    setModelProvider("ollama");
-                    setSelectedOllamaModel(model.model);
-                    closeMenu();
-                  }}
-                >
-                  <span className="menu-item-title">{model.name}</span>
-                  <span className="menu-item-description">
-                    {[model.parameterSize, model.contextLength ? `${formatThousandsWithSuffix(model.contextLength)}` : null]
-                      .filter(Boolean)
-                      .join(" · ")}
-                  </span>
-                </button>
+                (() => {
+                  const hasWarning = getLocalModelWarningState("ollama", model);
+                  return (
+                    <button
+                      key={model.model}
+                      className={modelProvider === "ollama" && selectedOllamaModel === model.model ? "menu-item active" : "menu-item"}
+                      onClick={() => {
+                        maybeWarnForLocalModelSelection("ollama", model.model, model);
+                      }}
+                    >
+                      <span className="menu-item-title-row">
+                        <span className="menu-item-title">{model.name}</span>
+                        {hasWarning ? (
+                          <span className="menu-item-warning-icon" aria-hidden="true">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 28">
+                              <path d="M16 4.879c-1.299.002-2.597.621-3.328 1.857L.588 27.162C-.866 29.62.989 32.87 3.844 32.87h24.398c2.854 0 4.705-3.252 3.246-5.705L19.334 6.73C18.6 5.494 17.299 4.878 16 4.879zm0 8.494a1.5 1.5 0 0 1 1.5 1.5v6.496a1.5 1.5 0 0 1-3 0v-6.496a1.5 1.5 0 0 1 1.5-1.5zm0 11.496a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3z" transform="translate(0 -4.87)" />
+                            </svg>
+                          </span>
+                        ) : null}
+                      </span>
+                      <span className={`menu-item-description ${hasWarning ? "is-warning" : ""}`}>
+                        {[
+                          [model.parameterSize, model.contextLength ? `${formatThousandsWithSuffix(model.contextLength)}` : null]
+                            .filter(Boolean)
+                            .join(" · "),
+                          hasWarning ? text.modelWarningMenu : null,
+                        ]
+                          .filter(Boolean)
+                          .join(" · ")}
+                      </span>
+                    </button>
+                  );
+                })()
+              ))}
+            </>
+          ) : null}
+          {isLmStudioAvailable && lmStudioModels.length > 0 ? (
+            <>
+              <div className="menu-section-label">{text.modelLmStudioSection}</div>
+              {lmStudioModels.map((model) => (
+                (() => {
+                  const hasWarning = getLocalModelWarningState("lmstudio", model);
+                  return (
+                    <button
+                      key={model.id}
+                      className={modelProvider === "lmstudio" && selectedLmStudioModel === model.id ? "menu-item active" : "menu-item"}
+                      onClick={() => {
+                        maybeWarnForLocalModelSelection("lmstudio", model.id, model);
+                      }}
+                    >
+                      <span className="menu-item-title-row">
+                        <span className="menu-item-title">{model.name}</span>
+                        {hasWarning ? (
+                          <span className="menu-item-warning-icon" aria-hidden="true">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 28">
+                              <path d="M16 4.879c-1.299.002-2.597.621-3.328 1.857L.588 27.162C-.866 29.62.989 32.87 3.844 32.87h24.398c2.854 0 4.705-3.252 3.246-5.705L19.334 6.73C18.6 5.494 17.299 4.878 16 4.879zm0 8.494a1.5 1.5 0 0 1 1.5 1.5v6.496a1.5 1.5 0 0 1-3 0v-6.496a1.5 1.5 0 0 1 1.5-1.5zm0 11.496a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3z" transform="translate(0 -4.87)" />
+                            </svg>
+                          </span>
+                        ) : null}
+                      </span>
+                      <span className={`menu-item-description ${hasWarning ? "is-warning" : ""}`}>
+                        {[model.ownedBy ?? "LM Studio", hasWarning ? text.modelWarningMenu : null]
+                          .filter(Boolean)
+                          .join(" · ")}
+                      </span>
+                    </button>
+                  );
+                })()
               ))}
             </>
           ) : null}
@@ -4339,6 +4994,7 @@ export function App() {
             left: `${menuPosition.left}px`,
             top: `${menuPosition.top}px`,
             minWidth: `${menuPosition.minWidth}px`,
+            maxHeight: `${menuPosition.maxHeight}px`,
           }}
         >
           {content}
@@ -4401,8 +5057,28 @@ export function App() {
               />
             </label>
             <label className="settings-field">
-              <span className="settings-label">{text.settingsOllamaLabel}</span>
-              <span className="settings-description">{isOllamaAvailable ? text.settingsOllamaAvailable : text.settingsOllamaUnavailable}</span>
+              <span className="settings-label">{text.settingsOllamaContextLengthLabel}</span>
+              <span className="settings-description">{text.settingsOllamaContextLengthDescription}</span>
+              <input
+                type="text"
+                inputMode="numeric"
+                value={ollamaContextLengthDraft}
+                onChange={(event) => setOllamaContextLengthDraft(event.target.value)}
+                placeholder={text.settingsAutomaticPlaceholder}
+                autoComplete="off"
+              />
+            </label>
+            <label className="settings-field">
+              <span className="settings-label">{text.settingsLmStudioContextLengthLabel}</span>
+              <span className="settings-description">{text.settingsLmStudioContextLengthDescription}</span>
+              <input
+                type="text"
+                inputMode="numeric"
+                value={lmStudioContextLengthDraft}
+                onChange={(event) => setLmStudioContextLengthDraft(event.target.value)}
+                placeholder={text.settingsAutomaticPlaceholder}
+                autoComplete="off"
+              />
             </label>
             <label className="settings-field">
               <span className="settings-label">{text.settingsGlobalSystemPromptLabel}</span>
@@ -4480,6 +5156,56 @@ export function App() {
             </section>
           </>
         ) : null}
+      </>,
+      document.body,
+    );
+  }
+
+  function renderModelSelectionWarning() {
+    if (!modelSelectionWarning) {
+      return null;
+    }
+
+    return createPortal(
+      <>
+        <button
+          className={`settings-backdrop settings-warning-backdrop ${isModelSelectionWarningVisible ? "is-open" : "is-closing"}`}
+          aria-label={text.cancel}
+        />
+        <section
+          className={`settings-modal settings-warning-modal settings-model-warning-modal ${isModelSelectionWarningVisible ? "is-open" : "is-closing"}`}
+          aria-label={modelSelectionWarning.title}
+        >
+          <div className="settings-header settings-model-warning-header">
+            <div className="settings-title-group settings-model-warning-title-group">
+              <div className="settings-model-warning-copy">
+                <div className="settings-model-warning-title-line">
+                  <strong>{modelSelectionWarning.title}</strong>
+                </div>
+                <p>{modelSelectionWarning.description}</p>
+              </div>
+            </div>
+            <button className="settings-close" onClick={handleCloseModelSelectionWarning} aria-label={text.cancel}>
+              <svg xmlns="http://www.w3.org/2000/svg" xmlSpace="preserve" viewBox="0 0 32 32">
+                <path d="M5.746 4.246a1.5 1.5 0 0 0-1.06.44 1.5 1.5 0 0 0 0 2.12L13.879 16l-9.193 9.193a1.5 1.5 0 0 0 0 2.121 1.5 1.5 0 0 0 2.12 0L16 18.121l9.193 9.193a1.5 1.5 0 0 0 2.121 0 1.5 1.5 0 0 0 0-2.12L18.121 16l9.193-9.193a1.5 1.5 0 0 0 0-2.121 1.5 1.5 0 0 0-1.06-.44 1.5 1.5 0 0 0-1.06.44L16 13.879 6.807 4.686a1.5 1.5 0 0 0-1.06-.44Z" />
+              </svg>
+            </button>
+          </div>
+          <div className="settings-actions settings-warning-actions">
+            <button className="settings-secondary" onClick={handleCloseModelSelectionWarning}>
+              {text.cancel}
+            </button>
+            <button
+              className="settings-danger-button"
+              onClick={() => {
+                applyLocalModelSelection(modelSelectionWarning.provider, modelSelectionWarning.modelId);
+                handleCloseModelSelectionWarning();
+              }}
+            >
+              {text.modelWarningConfirm}
+            </button>
+          </div>
+        </section>
       </>,
       document.body,
     );
@@ -4656,7 +5382,7 @@ export function App() {
                         item.message.status ? (
                           <p className="status-text">{getStatusLabel(text, item.message.status, item.message.activityStatusLabel, item.message.diffPath, locale)}</p>
                         ) : item.message.role === "assistant" ? (
-                          <AnimatedMarkdown text={item.message.text} chunks={item.message.textChunks} animate={Boolean(item.message.streaming)} onOpenLink={handleOpenBrowserPanelLink} />
+                          <AnimatedMarkdown text={item.message.text} chunks={item.message.textChunks} animate={Boolean(item.message.streaming)} onOpenLink={handleAssistantLink} />
                         ) : (
                           <p>{item.message.text}</p>
                         )
@@ -4752,7 +5478,7 @@ export function App() {
         ) : null}
 
         <div ref={composerWrapRef} className="composer-wrap">
-          <div className={`composer ${isComposerDragActive ? "is-drag-active" : ""}`} onDragOver={handleComposerDragOver} onDragLeave={handleComposerDragLeave} onDrop={(event) => void handleComposerDrop(event)}>
+          <div className={`composer ${isComposerDragActive ? "is-drag-active" : ""} ${openMenu ? "is-menu-open" : ""}`} onDragOver={handleComposerDragOver} onDragLeave={handleComposerDragLeave} onDrop={(event) => void handleComposerDrop(event)}>
             <input
               ref={composerFileInputRef}
               className="composer-file-input"
@@ -4794,6 +5520,8 @@ export function App() {
                   <button
                     ref={(node) => { triggerRefs.current.attach = node; }}
                     className={`attach-button ${openMenu === "attach" ? "open" : ""}`}
+                    onMouseDown={preventMouseFocus}
+                    onPointerDown={preventMouseFocus}
                     onClick={() => setOpenMenu((current) => (current === "attach" ? null : "attach"))}
                     aria-label="사진 및 파일 첨부"
                   >
@@ -4802,12 +5530,12 @@ export function App() {
                     </svg>
                   </button>
                 </div>
-                <div className="dropdown-shell"><button ref={(node) => { triggerRefs.current.model = node; }} className={`custom-select ${openMenu === "model" ? "open" : ""}`} onClick={() => setOpenMenu((current) => (current === "model" ? null : "model"))} aria-label="Open model options"><span className="custom-select-main"><span className="custom-select-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 28"><path d="M16 0a2.5 2.5 0 0 0-2.5 2.5 2.5 2.5 0 0 0 1 1.992V6h-5C6.48 6 4 8.48 4 11.5v11C4 25.52 6.48 28 9.5 28h13c3.02 0 5.5-2.48 5.5-5.5v-11C28 8.48 25.52 6 22.5 6h-5V4.492a2.5 2.5 0 0 0 1-1.992A2.5 2.5 0 0 0 16 0ZM9.5 9h13c1.398 0 2.5 1.102 2.5 2.5v11c0 1.398-1.102 2.5-2.5 2.5h-13A2.478 2.478 0 0 1 7 22.5v-11C7 10.102 8.102 9 9.5 9Zm-8 3A1.5 1.5 0 0 0 0 13.5v6a1.5 1.5 0 0 0 3 0v-6A1.5 1.5 0 0 0 1.5 12Zm29 0a1.5 1.5 0 0 0-1.5 1.5v6a1.5 1.5 0 0 0 3 0v-6a1.5 1.5 0 0 0-1.5-1.5ZM12 15a2 2 0 1 0 0 4 2 2 0 0 0 0-4zm8 0a2 2 0 1 0 0 4 2 2 0 0 0 0-4z" /></svg></span><span className="custom-select-label">{activeModelLabel}</span></span><span className="custom-select-arrow" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" xmlSpace="preserve" viewBox="0 0 32 20"><path d="M31.998 4.144a1.5 1.5 0 0 0-.498-1.033 1.5 1.5 0 0 0-2.117.117L17.674 16.311c-.85.95-2.274.956-3.133.013L2.61 3.218a1.5 1.5 0 0 0-2.12-.1 1.5 1.5 0 0 0-.1 2.12l11.932 13.106c2.023 2.222 5.585 2.206 7.588-.033L31.617 5.228a1.5 1.5 0 0 0 .381-1.084Z" /></svg></span></button></div>
-                <div className="dropdown-shell"><button ref={(node) => { triggerRefs.current.mode = node; }} className={`custom-select ${openMenu === "mode" ? "open" : ""}`} onClick={() => setOpenMenu((current) => (current === "mode" ? null : "mode"))} aria-label="Open mode options"><span className="custom-select-main"><span className="custom-select-icon mode-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><path d="M10.49 0C9.14 0 7.8.28 6.56.8a1.5 1.5 0 0 0-.53 2.4l4.7 5.12-2.41 2.42L3.2 6.03a1.5 1.5 0 0 0-2.4.53 10.5 10.5 0 0 0-.8 3.93 1.5 1.5 0 0 0 0 .01C0 16.28 4.72 21 10.5 21a1.5 1.5 0 0 0 .01 0c.98 0 1.91-.3 2.85-.57L23.9 30.98a3.52 3.52 0 0 0 4.95 0l2.12-2.12a3.52 3.52 0 0 0 0-4.95L20.43 13.36c.27-.94.56-1.87.57-2.85a1.5 1.5 0 0 0 0-.01C21 4.72 16.28 0 10.5 0a1.5 1.5 0 0 0-.01 0zm.02 3a7.47 7.47 0 0 1 6.93 10.3 1.5 1.5 0 0 0 .32 1.63l11.1 11.1c.2.2.2.5 0 .7l-2.12 2.13c-.21.2-.5.2-.7 0l-11.1-11.1a1.5 1.5 0 0 0-1.64-.32A7.47 7.47 0 0 1 3 10.5c0-.17.09-.33.1-.5l4.25 3.9a1.5 1.5 0 0 0 2.07-.04l4.46-4.45a1.5 1.5 0 0 0 .04-2.07l-3.9-4.25c.16-.01.32-.1.49-.1z" /></svg></span><span className="custom-select-label">{mode === "auto" ? text.auto : getModeLabel(mode, text)}</span></span><span className="custom-select-arrow" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" xmlSpace="preserve" viewBox="0 0 32 20"><path d="M31.998 4.144a1.5 1.5 0 0 0-.498-1.033 1.5 1.5 0 0 0-2.117.117L17.674 16.311c-.85.95-2.274.956-3.133.013L2.61 3.218a1.5 1.5 0 0 0-2.12-.1 1.5 1.5 0 0 0-.1 2.12l11.932 13.106c2.023 2.222 5.585 2.206 7.588-.033L31.617 5.228a1.5 1.5 0 0 0 .381-1.084Z" /></svg></span></button></div>
-                <div className="dropdown-shell"><button ref={(node) => { triggerRefs.current.thoroughness = node; }} className={`custom-select ${openMenu === "thoroughness" ? "open" : ""}`} onClick={() => setOpenMenu((current) => (current === "thoroughness" ? null : "thoroughness"))} aria-label="Open thoroughness options"><span className="custom-select-main"><span className="custom-select-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 32"><path d="M12 0C5.39 0 0 5.39 0 12v.004c.012 4.568 2.689 8.608 6.723 10.615V25.5a1.5 1.5 0 0 0 1.5 1.5h7.554a1.5 1.5 0 0 0 1.5-1.5v-2.88c4.034-2.008 6.711-6.048 6.723-10.616V12c0-6.61-5.39-12-12-12Zm0 3a8.977 8.977 0 0 1 9 8.998 8.989 8.989 0 0 1-5.762 8.371 1.5 1.5 0 0 0-.96 1.4V24H9.722v-2.23a1.5 1.5 0 0 0-.961-1.4A8.989 8.989 0 0 1 3 12v-.004A8.977 8.977 0 0 1 12 3ZM9.5 29a1.5 1.5 0 0 0 0 3h5a1.5 1.5 0 0 0 0-3Z" /></svg></span><span className="custom-select-label">{thoroughness === "light" ? text.thoroughnessLight : thoroughness === "deep" ? text.thoroughnessDeep : text.thoroughnessBalanced}</span></span><span className="custom-select-arrow" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" xmlSpace="preserve" viewBox="0 0 32 20"><path d="M31.998 4.144a1.5 1.5 0 0 0-.498-1.033 1.5 1.5 0 0 0-2.117.117L17.674 16.311c-.85.95-2.274.956-3.133.013L2.61 3.218a1.5 1.5 0 0 0-2.12-.1 1.5 1.5 0 0 0-.1 2.12l11.932 13.106c2.023 2.222 5.585 2.206 7.588-.033L31.617 5.228a1.5 1.5 0 0 0 .381-1.084Z" /></svg></span></button></div>
+                <div className="dropdown-shell"><button ref={(node) => { triggerRefs.current.model = node; }} className={`custom-select ${openMenu === "model" ? "open" : ""}`} onMouseDown={preventMouseFocus} onPointerDown={preventMouseFocus} onClick={() => setOpenMenu((current) => (current === "model" ? null : "model"))} aria-label="Open model options"><span className="custom-select-main"><span className="custom-select-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 28"><path d="M16 0a2.5 2.5 0 0 0-2.5 2.5 2.5 2.5 0 0 0 1 1.992V6h-5C6.48 6 4 8.48 4 11.5v11C4 25.52 6.48 28 9.5 28h13c3.02 0 5.5-2.48 5.5-5.5v-11C28 8.48 25.52 6 22.5 6h-5V4.492a2.5 2.5 0 0 0 1-1.992A2.5 2.5 0 0 0 16 0ZM9.5 9h13c1.398 0 2.5 1.102 2.5 2.5v11c0 1.398-1.102 2.5-2.5 2.5h-13A2.478 2.478 0 0 1 7 22.5v-11C7 10.102 8.102 9 9.5 9Zm-8 3A1.5 1.5 0 0 0 0 13.5v6a1.5 1.5 0 0 0 3 0v-6A1.5 1.5 0 0 0 1.5 12Zm29 0a1.5 1.5 0 0 0-1.5 1.5v6a1.5 1.5 0 0 0 3 0v-6a1.5 1.5 0 0 0-1.5-1.5ZM12 15a2 2 0 1 0 0 4 2 2 0 0 0 0-4zm8 0a2 2 0 1 0 0 4 2 2 0 0 0 0-4z" /></svg></span><span className="custom-select-label">{activeModelLabel}</span></span><span className="custom-select-arrow" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" xmlSpace="preserve" viewBox="0 0 32 20"><path d="M31.998 4.144a1.5 1.5 0 0 0-.498-1.033 1.5 1.5 0 0 0-2.117.117L17.674 16.311c-.85.95-2.274.956-3.133.013L2.61 3.218a1.5 1.5 0 0 0-2.12-.1 1.5 1.5 0 0 0-.1 2.12l11.932 13.106c2.023 2.222 5.585 2.206 7.588-.033L31.617 5.228a1.5 1.5 0 0 0 .381-1.084Z" /></svg></span></button></div>
+                <div className="dropdown-shell"><button ref={(node) => { triggerRefs.current.mode = node; }} className={`custom-select ${openMenu === "mode" ? "open" : ""}`} onMouseDown={preventMouseFocus} onPointerDown={preventMouseFocus} onClick={() => setOpenMenu((current) => (current === "mode" ? null : "mode"))} aria-label="Open mode options"><span className="custom-select-main"><span className="custom-select-icon mode-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><path d="M10.49 0C9.14 0 7.8.28 6.56.8a1.5 1.5 0 0 0-.53 2.4l4.7 5.12-2.41 2.42L3.2 6.03a1.5 1.5 0 0 0-2.4.53 10.5 10.5 0 0 0-.8 3.93 1.5 1.5 0 0 0 0 .01C0 16.28 4.72 21 10.5 21a1.5 1.5 0 0 0 .01 0c.98 0 1.91-.3 2.85-.57L23.9 30.98a3.52 3.52 0 0 0 4.95 0l2.12-2.12a3.52 3.52 0 0 0 0-4.95L20.43 13.36c.27-.94.56-1.87.57-2.85a1.5 1.5 0 0 0 0-.01C21 4.72 16.28 0 10.5 0a1.5 1.5 0 0 0-.01 0zm.02 3a7.47 7.47 0 0 1 6.93 10.3 1.5 1.5 0 0 0 .32 1.63l11.1 11.1c.2.2.2.5 0 .7l-2.12 2.13c-.21.2-.5.2-.7 0l-11.1-11.1a1.5 1.5 0 0 0-1.64-.32A7.47 7.47 0 0 1 3 10.5c0-.17.09-.33.1-.5l4.25 3.9a1.5 1.5 0 0 0 2.07-.04l4.46-4.45a1.5 1.5 0 0 0 .04-2.07l-3.9-4.25c.16-.01.32-.1.49-.1z" /></svg></span><span className="custom-select-label">{mode === "auto" ? text.auto : getModeLabel(mode, text)}</span></span><span className="custom-select-arrow" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" xmlSpace="preserve" viewBox="0 0 32 20"><path d="M31.998 4.144a1.5 1.5 0 0 0-.498-1.033 1.5 1.5 0 0 0-2.117.117L17.674 16.311c-.85.95-2.274.956-3.133.013L2.61 3.218a1.5 1.5 0 0 0-2.12-.1 1.5 1.5 0 0 0-.1 2.12l11.932 13.106c2.023 2.222 5.585 2.206 7.588-.033L31.617 5.228a1.5 1.5 0 0 0 .381-1.084Z" /></svg></span></button></div>
+                <div className="dropdown-shell"><button ref={(node) => { triggerRefs.current.thoroughness = node; }} className={`custom-select ${openMenu === "thoroughness" ? "open" : ""}`} onMouseDown={preventMouseFocus} onPointerDown={preventMouseFocus} onClick={() => setOpenMenu((current) => (current === "thoroughness" ? null : "thoroughness"))} aria-label="Open thoroughness options"><span className="custom-select-main"><span className="custom-select-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 32"><path d="M12 0C5.39 0 0 5.39 0 12v.004c.012 4.568 2.689 8.608 6.723 10.615V25.5a1.5 1.5 0 0 0 1.5 1.5h7.554a1.5 1.5 0 0 0 1.5-1.5v-2.88c4.034-2.008 6.711-6.048 6.723-10.616V12c0-6.61-5.39-12-12-12Zm0 3a8.977 8.977 0 0 1 9 8.998 8.989 8.989 0 0 1-5.762 8.371 1.5 1.5 0 0 0-.96 1.4V24H9.722v-2.23a1.5 1.5 0 0 0-.961-1.4A8.989 8.989 0 0 1 3 12v-.004A8.977 8.977 0 0 1 12 3ZM9.5 29a1.5 1.5 0 0 0 0 3h5a1.5 1.5 0 0 0 0-3Z" /></svg></span><span className="custom-select-label">{thoroughness === "light" ? text.thoroughnessLight : thoroughness === "deep" ? text.thoroughnessDeep : text.thoroughnessBalanced}</span></span><span className="custom-select-arrow" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" xmlSpace="preserve" viewBox="0 0 32 20"><path d="M31.998 4.144a1.5 1.5 0 0 0-.498-1.033 1.5 1.5 0 0 0-2.117.117L17.674 16.311c-.85.95-2.274.956-3.133.013L2.61 3.218a1.5 1.5 0 0 0-2.12-.1 1.5 1.5 0 0 0-.1 2.12l11.932 13.106c2.023 2.222 5.585 2.206 7.588-.033L31.617 5.228a1.5 1.5 0 0 0 .381-1.084Z" /></svg></span></button></div>
               </div>
               <div className="context-usage-shell" aria-label={`${text.contextUsage} ${contextUsageDisplay.usagePercent}%`} onMouseEnter={() => setIsContextUsageTooltipOpen(true)} onMouseLeave={() => setIsContextUsageTooltipOpen(false)}>
-                <button ref={contextUsageButtonRef} className="context-usage-button" type="button" onFocus={() => setIsContextUsageTooltipOpen(true)} onBlur={() => setIsContextUsageTooltipOpen(false)}>
+                <button ref={contextUsageButtonRef} className="context-usage-button" type="button" onMouseDown={preventMouseFocus} onPointerDown={preventMouseFocus} onFocus={() => setIsContextUsageTooltipOpen(true)} onBlur={() => setIsContextUsageTooltipOpen(false)}>
                   <svg className="context-usage-ring" viewBox="0 0 32 32" aria-hidden="true">
                     <circle className="context-usage-track" cx={contextCircleCenter} cy={contextCircleCenter} r={contextCircleRadius} />
                     <circle className="context-usage-progress" cx={contextCircleCenter} cy={contextCircleCenter} r={contextCircleRadius} strokeDasharray={contextCircleCircumference} strokeDashoffset={contextCircleOffset} />
@@ -4823,6 +5551,7 @@ export function App() {
       </main>
       {renderMenu()}
       {renderSettingsModal()}
+      {renderModelSelectionWarning()}
       {contextUsageTooltip}
     </div>
   );

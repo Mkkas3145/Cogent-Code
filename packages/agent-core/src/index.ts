@@ -12,6 +12,7 @@
   RetrievalBundle,
   TaskRequest,
 } from "@cogent/shared-types";
+import { totalmem } from "node:os";
 
 type ToolHandlers = {
   readFile: (targetPath: string) => Promise<{ path: string; content: string }>;
@@ -124,6 +125,50 @@ type OllamaChatResponse = {
   };
   done?: boolean;
   prompt_eval_count?: number;
+};
+
+type OpenAiToolCall = {
+  id?: string;
+  type?: "function";
+  function?: {
+    name?: string;
+    arguments?: string;
+  };
+};
+
+type OpenAiChatMessage = {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | Array<{ type: "text"; text: string }>;
+  tool_calls?: OpenAiToolCall[];
+  tool_call_id?: string;
+};
+
+type OpenAiChatCompletionResponse = {
+  choices?: Array<{
+    message?: {
+      role?: string;
+      content?: string | null;
+      tool_calls?: OpenAiToolCall[];
+    };
+    delta?: {
+      content?: string | null;
+      tool_calls?: Array<{
+        index?: number;
+        id?: string;
+        type?: "function";
+        function?: {
+          name?: string;
+          arguments?: string;
+        };
+      }>;
+    };
+    finish_reason?: string | null;
+  }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
 };
 
 const FILE_TOOLS = [
@@ -461,6 +506,28 @@ const OLLAMA_TOOL_DEFINITIONS = FILE_TOOLS.map((tool) => ({
   },
 }));
 
+const OPENAI_TOOL_DEFINITIONS = FILE_TOOLS.map((tool) => ({
+  type: "function",
+  function: {
+    name: tool.name,
+    description: tool.description,
+    parameters: {
+      type: "object",
+      properties: Object.fromEntries(
+        Object.entries(tool.parameters.properties).map(([key, value]) => [
+          key,
+          {
+            type: String((value as { type?: string }).type ?? "STRING").toLowerCase(),
+            description: (value as { description?: string }).description,
+          },
+        ]),
+      ),
+      required: tool.parameters.required,
+      additionalProperties: false,
+    },
+  },
+}));
+
 function isFilesystemMutationCommand(command: string) {
   const normalized = command.trim().toLowerCase();
   return [
@@ -487,6 +554,15 @@ function isFilesystemMutationCommand(command: string) {
     /\badd-content\b/,
     /\bout-file\b/,
   ].some((pattern) => pattern.test(normalized));
+}
+
+function getDefaultLocalContextLength(totalMemoryBytes: number) {
+  const totalMemoryGb = totalMemoryBytes / 1024 / 1024 / 1024;
+  const reservedForSystemGb = Math.max(4, totalMemoryGb * 0.25);
+  const usableMemoryGb = Math.max(4, totalMemoryGb - reservedForSystemGb);
+  const estimatedContext = Math.floor(usableMemoryGb * 512);
+  const clampedContext = Math.max(4096, Math.min(32768, estimatedContext));
+  return Math.round(clampedContext / 1024) * 1024;
 }
 
 function classifyMode(request: TaskRequest): ModeDecision {
@@ -767,7 +843,7 @@ async function requestGemini(
   signal?: AbortSignal,
 ): Promise<GeminiCandidate> {
   const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${modelForTier(request.modelTier)}:generateContent`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${getEffectiveModelName(request)}:generateContent`,
     {
       method: "POST",
       headers: {
@@ -791,6 +867,51 @@ async function requestGemini(
   return parsed.candidates?.[0] ?? {};
 }
 
+async function sleep(ms: number, signal?: AbortSignal) {
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener("abort", handleAbort);
+      resolve();
+    }, ms);
+
+    const handleAbort = () => {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", handleAbort);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+
+    if (signal) {
+      signal.addEventListener("abort", handleAbort, { once: true });
+    }
+  });
+}
+
+async function requestGeminiWithRetry(
+  request: TaskRequest,
+  decision: ModeDecision,
+  retrieval: RetrievalBundle,
+  contents: GeminiContent[],
+  signal?: AbortSignal,
+): Promise<GeminiCandidate> {
+  const maxAttempts = 3;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await requestGemini(request, decision, retrieval, contents, signal);
+    } catch (error) {
+      lastError = error;
+      if (signal?.aborted || (error instanceof Error && error.name === "AbortError") || attempt >= maxAttempts) {
+        throw error;
+      }
+
+      await sleep(700 * attempt, signal);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Gemini request failed.");
+}
+
 async function requestOllamaChat(
   request: TaskRequest,
   messages: OllamaMessage[],
@@ -807,6 +928,11 @@ async function requestOllamaChat(
       model: getEffectiveModelName(request),
       stream: false,
       messages,
+      options: (request.ollamaContextLength || getDefaultLocalContextLength(totalmem()))
+        ? {
+            num_ctx: request.ollamaContextLength || getDefaultLocalContextLength(totalmem()),
+          }
+        : undefined,
       ...(includeTools ? { tools: OLLAMA_TOOL_DEFINITIONS } : {}),
     }),
   });
@@ -819,6 +945,92 @@ async function requestOllamaChat(
   return (await response.json()) as OllamaChatResponse;
 }
 
+function buildOpenAiMessages(
+  request: TaskRequest,
+  decision: ModeDecision,
+  retrieval: RetrievalBundle,
+  prompt: string,
+  history: ConversationTurn[],
+): OpenAiChatMessage[] {
+  const fileTextFor = (files: ConversationTurn["files"] | TaskRequest["currentPromptFiles"]) =>
+    (files ?? [])
+      .filter((file) => file.content.trim().length > 0)
+      .map((file) => `Attached file: ${file.name}\nMIME type: ${file.mimeType}\n\n\`\`\`\n${file.content}\n\`\`\``)
+      .join("\n\n");
+
+  const imageTextFor = (images: ConversationTurn["images"] | TaskRequest["currentPromptImages"]) =>
+    (images ?? [])
+      .map((image) => `Attached image: ${image.name} (${image.mimeType})`)
+      .join("\n");
+
+  return [
+    {
+      role: "system",
+      content: buildSystemInstruction(request, decision, retrieval),
+    },
+    ...history
+      .filter((turn) => turn.text.trim().length > 0 || (turn.files?.length ?? 0) > 0 || (turn.images?.length ?? 0) > 0)
+      .map((turn) => ({
+        role: turn.role,
+        content: [turn.text, imageTextFor(turn.images), fileTextFor(turn.files)].filter(Boolean).join("\n\n"),
+      })),
+    {
+      role: "user",
+      content: [prompt, imageTextFor(request.currentPromptImages), fileTextFor(request.currentPromptFiles)].filter(Boolean).join("\n\n"),
+    },
+  ];
+}
+
+async function requestLmStudioChat(
+  request: TaskRequest,
+  messages: OpenAiChatMessage[],
+  includeTools: boolean,
+  signal?: AbortSignal,
+): Promise<OpenAiChatCompletionResponse> {
+  const response = await fetch("http://127.0.0.1:1234/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    signal,
+    body: JSON.stringify({
+      model: getEffectiveModelName(request),
+      stream: false,
+      messages,
+      ...(includeTools ? { tools: OPENAI_TOOL_DEFINITIONS, tool_choice: "auto" } : {}),
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`LM Studio chat failed: ${response.status} ${body}`);
+  }
+
+  return (await response.json()) as OpenAiChatCompletionResponse;
+}
+
+function parseOpenAiToolCalls(
+  response: OpenAiChatCompletionResponse,
+): Array<{ id?: string; name: string; args: Record<string, unknown> }> {
+  return (response.choices?.[0]?.message?.tool_calls ?? []).flatMap((toolCall) => {
+    const name = toolCall.function?.name;
+    if (!name) {
+      return [];
+    }
+
+    const rawArguments = toolCall.function?.arguments;
+    if (typeof rawArguments !== "string" || !rawArguments.trim()) {
+      return [{ id: toolCall.id, name, args: {} }];
+    }
+
+    try {
+      return [{ id: toolCall.id, name, args: JSON.parse(rawArguments) as Record<string, unknown> }];
+    } catch {
+      return [{ id: toolCall.id, name, args: {} }];
+    }
+  });
+}
+
 async function* requestGeminiStream(
   request: TaskRequest,
   decision: ModeDecision,
@@ -828,7 +1040,7 @@ async function* requestGeminiStream(
   signal?: AbortSignal,
 ): AsyncGenerator<{ type: "text"; delta: string } | { type: "candidate"; candidate: GeminiCandidate }> {
   const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${modelForTier(request.modelTier)}:streamGenerateContent?alt=sse`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${getEffectiveModelName(request)}:streamGenerateContent?alt=sse`,
     {
       method: "POST",
       headers: {
@@ -846,7 +1058,7 @@ async function* requestGeminiStream(
   }
 
   if (!response.body) {
-    const fallbackCandidate = await requestGemini(request, decision, retrieval, contents, signal);
+    const fallbackCandidate = await requestGeminiWithRetry(request, decision, retrieval, contents, signal);
     const fallbackText = getTextFromParts(fallbackCandidate.content?.parts ?? []);
     if (fallbackText) {
       yield { type: "text", delta: fallbackText };
@@ -928,6 +1140,34 @@ async function* requestGeminiStream(
   yield { type: "candidate", candidate: latestCandidate };
 }
 
+async function* requestGeminiStreamWithRetry(
+  request: TaskRequest,
+  decision: ModeDecision,
+  retrieval: RetrievalBundle,
+  contents: GeminiContent[],
+  includeTools = false,
+  signal?: AbortSignal,
+): AsyncGenerator<{ type: "text"; delta: string } | { type: "candidate"; candidate: GeminiCandidate }> {
+  const maxAttempts = 3;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      yield* requestGeminiStream(request, decision, retrieval, contents, includeTools, signal);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (signal?.aborted || (error instanceof Error && error.name === "AbortError") || attempt >= maxAttempts) {
+        throw error;
+      }
+
+      await sleep(700 * attempt, signal);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Gemini stream request failed.");
+}
+
 async function* requestOllamaStream(
   request: TaskRequest,
   messages: OllamaMessage[],
@@ -944,6 +1184,11 @@ async function* requestOllamaStream(
       model: getEffectiveModelName(request),
       stream: true,
       messages,
+      options: (request.ollamaContextLength || getDefaultLocalContextLength(totalmem()))
+        ? {
+            num_ctx: request.ollamaContextLength || getDefaultLocalContextLength(totalmem()),
+          }
+        : undefined,
       ...(includeTools ? { tools: OLLAMA_TOOL_DEFINITIONS } : {}),
     }),
   });
@@ -1423,7 +1668,7 @@ async function* runGeminiAgentLoop(
     }
 
     yield { type: "status", label: turn === 0 ? "Loading" : "Thinking" };
-    const candidate = await requestGemini(request, decision, retrieval, currentContents, signal);
+    const candidate = await requestGeminiWithRetry(request, decision, retrieval, currentContents, signal);
     const parts = candidate.content?.parts ?? [];
     const functionCalls = getFunctionCalls(parts);
 
@@ -1449,7 +1694,7 @@ async function* runGeminiAgentLoop(
       let emittedCodeLength = 0;
       let streamedCandidate: GeminiCandidate = candidate;
 
-      for await (const chunk of requestGeminiStream(request, decision, retrieval, currentContents, false, signal)) {
+      for await (const chunk of requestGeminiStreamWithRetry(request, decision, retrieval, currentContents, false, signal)) {
         if (signal?.aborted) {
           yield { type: "done", summary: "Agent request canceled." };
           return;
@@ -1612,6 +1857,85 @@ async function* runOllamaAgentLoop(
   }
 }
 
+async function* runLmStudioAgentLoop(
+  request: TaskRequest,
+  decision: ModeDecision,
+  retrieval: RetrievalBundle,
+  handlers: ToolHandlers,
+  signal?: AbortSignal,
+): AsyncGenerator<AgentStreamEvent> {
+  const messages = buildOpenAiMessages(request, decision, retrieval, request.prompt, request.conversation ?? []);
+  let turn = 0;
+
+  while (true) {
+    if (signal?.aborted) {
+      yield { type: "done", summary: "Agent request canceled." };
+      return;
+    }
+
+    yield { type: "status", label: turn === 0 ? "Loading" : "Thinking" };
+    const response = await requestLmStudioChat(request, messages, true, signal);
+    const assistantMessage = response.choices?.[0]?.message;
+    const assistantContent = typeof assistantMessage?.content === "string" ? assistantMessage.content : "";
+    const toolCalls = parseOpenAiToolCalls(response);
+    const finishCall = toolCalls.find((call) => call.name === "finish_turn");
+
+    if (finishCall) {
+      const payload = getFinishTurnPayload(finishCall.args);
+      if (payload.message) {
+        yield { type: "message", chunk: payload.message };
+      } else if (assistantContent.trim()) {
+        yield { type: "message", chunk: assistantContent };
+      }
+      yield { type: "done", summary: payload.summary || "Agent turn completed." };
+      return;
+    }
+
+    for (const call of toolCalls) {
+      if ((call.name === "write_file" || call.name === "create_file") && typeof call.args.path === "string" && call.args.path.trim()) {
+        yield { type: "file-write-start", path: call.args.path };
+      }
+    }
+
+    if (toolCalls.length === 0) {
+      if (assistantContent) {
+        yield { type: "message", chunk: assistantContent };
+      }
+      await waitUntilAborted(signal);
+      yield { type: "done", summary: "Agent request canceled." };
+      return;
+    }
+
+    messages.push({
+      role: "assistant",
+      content: assistantContent,
+      tool_calls: assistantMessage?.tool_calls,
+    });
+
+    for (const call of toolCalls.filter((entry) => entry.name !== "finish_turn")) {
+      const execution = executeToolCall(call, handlers);
+      const iterator = execution[Symbol.asyncIterator]();
+      while (true) {
+        const next = await iterator.next();
+        if (next.done) {
+          const toolResponse =
+            "functionResponse" in next.value ? next.value.functionResponse?.response : undefined;
+          messages.push({
+            role: "tool",
+            tool_call_id: call.id,
+            content: JSON.stringify(toolResponse ?? {}),
+          });
+          break;
+        }
+
+        yield next.value;
+      }
+    }
+
+    turn += 1;
+  }
+}
+
 export async function* runAgentTask(
   request: TaskRequest,
   handlers: ToolHandlers,
@@ -1635,6 +1959,8 @@ export async function* runAgentTask(
   try {
     if (getModelProvider(request) === "ollama") {
       yield* runOllamaAgentLoop(request, decision, retrieval, handlers, signal);
+    } else if (getModelProvider(request) === "lmstudio") {
+      yield* runLmStudioAgentLoop(request, decision, retrieval, handlers, signal);
     } else {
       yield* runGeminiAgentLoop(request, decision, retrieval, handlers, signal);
     }
@@ -1644,7 +1970,12 @@ export async function* runAgentTask(
       return;
     }
 
-    const providerLabel = getModelProvider(request) === "ollama" ? "Ollama" : "Gemini";
+    const providerLabel =
+      getModelProvider(request) === "ollama"
+        ? "Ollama"
+        : getModelProvider(request) === "lmstudio"
+          ? "LM Studio"
+          : "Gemini";
     const message = error instanceof Error ? error.message : `Unknown ${providerLabel} error`;
     yield { type: "message", chunk: `${providerLabel} request failed: ${message}` };
     yield { type: "done", summary: `${providerLabel} request failed.` };
@@ -1652,10 +1983,17 @@ export async function* runAgentTask(
 }
 
 function getEffectiveModelName(request: TaskRequest): string {
+  if (getModelProvider(request) === "gemini") {
+    return request.modelId?.trim() || modelForTier(request.modelTier);
+  }
+
   if (getModelProvider(request) === "ollama") {
     return request.modelId?.trim() || "llama3:latest";
   }
 
+  if (getModelProvider(request) === "lmstudio") {
+    return request.modelId?.trim() || "local-model";
+  }
   return modelForTier(request.modelTier);
 }
 
@@ -1676,6 +2014,25 @@ export async function buildContextUsageSnapshot(request: TaskRequest): Promise<C
     const modeDecision = classifyMode(request);
     const retrieval = buildRetrievalBundle(request, modeDecision);
     const messages = buildOllamaMessages(request, modeDecision, retrieval, request.prompt, request.conversation ?? []);
+    let runningContextLength: number | null = null;
+
+    try {
+      const runningResponse = await fetch("http://127.0.0.1:11434/api/ps");
+      if (runningResponse.ok) {
+        const runningPayload = (await runningResponse.json()) as {
+          models?: Array<{
+            model?: string;
+            name?: string;
+            context_length?: number;
+          }>;
+        };
+        const matchingModel = (runningPayload.models ?? []).find((entry) => (entry.model ?? entry.name ?? "") === model);
+        runningContextLength = typeof matchingModel?.context_length === "number" ? matchingModel.context_length : null;
+      }
+    } catch {
+      runningContextLength = null;
+    }
+
     const showResponse = await fetch("http://127.0.0.1:11434/api/show", {
       method: "POST",
       headers: {
@@ -1691,7 +2048,14 @@ export async function buildContextUsageSnapshot(request: TaskRequest): Promise<C
 
     const showPayload = (await showResponse.json()) as { model_info?: Record<string, unknown> };
     const contextLengthEntry = Object.entries(showPayload.model_info ?? {}).find(([key]) => key.endsWith(".context_length"));
-    const inputTokenLimit = typeof contextLengthEntry?.[1] === "number" ? contextLengthEntry[1] : 131_072;
+    const inputTokenLimit =
+      request.ollamaContextLength && request.ollamaContextLength > 0
+        ? request.ollamaContextLength
+        : runningContextLength && runningContextLength > 0
+          ? runningContextLength
+        : typeof contextLengthEntry?.[1] === "number"
+          ? contextLengthEntry[1]
+          : 131_072;
     const countResponse = await fetch("http://127.0.0.1:11434/api/chat", {
       method: "POST",
       headers: {
@@ -1714,6 +2078,43 @@ export async function buildContextUsageSnapshot(request: TaskRequest): Promise<C
 
     const countPayload = (await countResponse.json()) as OllamaChatResponse;
     const usedTokens = countPayload.prompt_eval_count ?? 0;
+
+    return {
+      model,
+      usedTokens,
+      inputTokenLimit,
+      usagePercent: Math.max(0, Math.min(100, Math.round((usedTokens / inputTokenLimit) * 100))),
+      compressionState: retrieval.compressionState,
+      snippetCount: retrieval.snippets.length,
+    };
+  }
+
+  if (getModelProvider(request) === "lmstudio") {
+    const model = getEffectiveModelName(request);
+    const modeDecision = classifyMode(request);
+    const retrieval = buildRetrievalBundle(request, modeDecision);
+    const messages = buildOpenAiMessages(request, modeDecision, retrieval, request.prompt, request.conversation ?? []);
+    const countResponse = await fetch("http://127.0.0.1:1234/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        stream: false,
+        max_tokens: 1,
+        messages,
+      }),
+    });
+
+    if (!countResponse.ok) {
+      const body = await countResponse.text();
+      throw new Error(`LM Studio chat count failed: ${countResponse.status} ${body}`);
+    }
+
+    const countPayload = (await countResponse.json()) as OpenAiChatCompletionResponse;
+    const usedTokens = countPayload.usage?.prompt_tokens ?? 0;
+    const inputTokenLimit = 32_768;
 
     return {
       model,

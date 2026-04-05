@@ -1,7 +1,16 @@
 export type AgentMode = "auto" | "backend" | "frontend";
 
 export type ModelTier = "flash-lite" | "flash" | "pro";
-export type ModelProvider = "gemini" | "ollama";
+export type ModelProvider = "gemini" | "ollama" | "lmstudio";
+
+export type GeminiModelSummary = {
+  id: string;
+  name: string;
+  description?: string;
+  inputTokenLimit?: number | null;
+  outputTokenLimit?: number | null;
+  supportsImages?: boolean;
+};
 
 export type OllamaModelSummary = {
   name: string;
@@ -10,6 +19,13 @@ export type OllamaModelSummary = {
   modifiedAt: string;
   parameterSize?: string;
   family?: string;
+  contextLength?: number | null;
+};
+
+export type LmStudioModelSummary = {
+  id: string;
+  name: string;
+  ownedBy?: string;
   contextLength?: number | null;
 };
 
@@ -40,6 +56,8 @@ export type ConversationTurn = {
 export type TaskRequest = {
   prompt: string;
   globalSystemPrompt?: string;
+  ollamaContextLength?: number;
+  lmStudioContextLength?: number;
   currentPromptImages?: Array<{
     id: string;
     name: string;

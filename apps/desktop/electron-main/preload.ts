@@ -4,6 +4,8 @@ import type {
   BrowserAssistResult,
   ContextSnapshot,
   ContextUsageSnapshot,
+  GeminiModelSummary,
+  LmStudioModelSummary,
   OllamaModelSummary,
   RunCommandRequest,
   TaskRequest,
@@ -51,8 +53,15 @@ contextBridge.exposeInMainWorld("cogent", {
   runCommand: async (request: RunCommandRequest): Promise<AgentStreamEvent[]> =>
     ipcRenderer.invoke("command:run", request),
   getGpuStatus: async (): Promise<unknown> => ipcRenderer.invoke("system:gpu-status"),
+  getMemoryInfo: async (): Promise<{ totalMemoryBytes: number; freeMemoryBytes: number }> => ipcRenderer.invoke("system:memory-info"),
+  getGeminiModels: async (apiKey: string): Promise<{ available: boolean; models: GeminiModelSummary[]; error?: string }> =>
+    ipcRenderer.invoke("system:gemini-models", apiKey),
   getOllamaModels: async (): Promise<{ available: boolean; models: OllamaModelSummary[]; error?: string }> =>
     ipcRenderer.invoke("system:ollama-models"),
+  getLmStudioModels: async (): Promise<{ available: boolean; models: LmStudioModelSummary[]; error?: string }> =>
+    ipcRenderer.invoke("system:lmstudio-models"),
+  cleanupLocalModels: async (payload: { provider?: "ollama" | "lmstudio" | "gemini"; modelId?: string }): Promise<{ cleaned: boolean }> =>
+    ipcRenderer.invoke("system:cleanup-local-models", payload),
   windowControls: {
     minimize: async (): Promise<void> => ipcRenderer.invoke("window:minimize"),
     maximizeToggle: async (): Promise<{ maximized: boolean }> => ipcRenderer.invoke("window:maximize-toggle"),

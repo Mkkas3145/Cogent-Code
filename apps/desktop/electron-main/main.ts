@@ -1,7 +1,10 @@
 ﻿import { app, BrowserWindow, dialog, ipcMain } from "electron";
+import { execFile } from "node:child_process";
 import { mkdir, readFile, readdir, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { buildContextSnapshot, buildContextUsageSnapshot, runAgentTask } from "@cogent/agent-core";
 import { streamCommand } from "@cogent/command-runtime";
 import type {
@@ -10,6 +13,9 @@ import type {
   BrowserAssistResult,
   CommandChunk,
   ContextUsageSnapshot,
+  GeminiModelSummary,
+  LmStudioModelSummary,
+  ModelProvider,
   OllamaModelSummary,
   RunCommandRequest,
   TaskRequest,
@@ -27,6 +33,9 @@ const windowWorkspaceRoots = new Map<number, string>();
 const activeAgentRuns = new Map<string, AbortController>();
 const activeOllamaRequestCounts = new Map<string, number>();
 const knownOllamaModels = new Set<string>();
+let isRunningShutdownCleanup = false;
+let didFinishShutdownCleanup = false;
+let shutdownCleanupPromise: Promise<void> | null = null;
 const pendingBrowserAssistRequests = new Map<
   string,
   {
@@ -38,11 +47,48 @@ const pendingBrowserAssistRequests = new Map<
 const preloadPath = isDev
   ? path.resolve(currentDir, "..", "..", "..", "..", "desktop", "electron-main", "preload.cjs")
   : path.join(app.getAppPath(), "apps", "desktop", "electron-main", "preload.cjs");
+const execFileAsync = promisify(execFile);
 
 function delay(ms: number) {
   return new Promise<void>((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function compareGeminiModelPriority(left: GeminiModelSummary, right: GeminiModelSummary) {
+  const tokenize = (value: string) =>
+    value
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(Boolean);
+
+  const extractVersion = (value: string) => {
+    const match = value.match(/gemini[-\s]?(\d+(?:\.\d+)?)/i);
+    return match ? Number(match[1]) : 0;
+  };
+
+  const scoreVariant = (value: string) => {
+    const tokens = tokenize(value);
+    if (tokens.includes("pro")) return 5;
+    if (tokens.includes("flash") && tokens.includes("lite")) return 3;
+    if (tokens.includes("flash")) return 4;
+    return 2;
+  };
+
+  const leftSource = `${left.id} ${left.name}`;
+  const rightSource = `${right.id} ${right.name}`;
+
+  const versionDiff = extractVersion(rightSource) - extractVersion(leftSource);
+  if (versionDiff !== 0) {
+    return versionDiff;
+  }
+
+  const variantDiff = scoreVariant(rightSource) - scoreVariant(leftSource);
+  if (variantDiff !== 0) {
+    return variantDiff;
+  }
+
+  return left.name.localeCompare(right.name);
 }
 
 async function waitForPageSettled(webContents: Electron.WebContents, options?: { minWaitMs?: number; maxWaitMs?: number; stableRounds?: number }) {
@@ -366,6 +412,7 @@ function resolveToolPath(targetPath: string, rootPath: string) {
 }
 
 async function getOllamaModels(): Promise<OllamaModelSummary[]> {
+  const loadedContexts = await getLoadedOllamaModelContexts();
   const tagsResponse = await fetch("http://127.0.0.1:11434/api/tags");
   if (!tagsResponse.ok) {
     const body = await tagsResponse.text();
@@ -416,10 +463,229 @@ async function getOllamaModels(): Promise<OllamaModelSummary[]> {
         modifiedAt: model.modified_at ?? "",
         parameterSize: model.details?.parameter_size,
         family: model.details?.family,
-        contextLength,
+        contextLength: loadedContexts.get(model.model ?? model.name ?? "") ?? contextLength,
       } satisfies OllamaModelSummary;
     }),
   );
+}
+
+async function getLoadedOllamaModelContexts(): Promise<Map<string, number>> {
+  try {
+    const response = await fetch("http://127.0.0.1:11434/api/ps");
+    if (!response.ok) {
+      return new Map();
+    }
+
+    const payload = (await response.json()) as {
+      models?: Array<{
+        model?: string;
+        name?: string;
+        context_length?: number;
+      }>;
+    };
+
+    return new Map(
+      (payload.models ?? [])
+        .map((model) => ({
+          id: (model.model ?? model.name ?? "").trim(),
+          contextLength: model.context_length,
+        }))
+        .filter((entry): entry is { id: string; contextLength: number } => entry.id.length > 0 && typeof entry.contextLength === "number")
+        .map((entry) => [entry.id, entry.contextLength] as const),
+    );
+  } catch {
+    return new Map();
+  }
+}
+
+async function getLmStudioModels(): Promise<LmStudioModelSummary[]> {
+  const cliPath = path.join(process.env.USERPROFILE ?? "", ".lmstudio", "bin", "lms.exe");
+  const { stdout } = await execFileAsync(cliPath, ["ls", "--llm", "--json"], {
+    windowsHide: true,
+    timeout: 15000,
+    maxBuffer: 1024 * 1024 * 8,
+  });
+
+  const modelsPayload = JSON.parse(stdout) as Array<{
+    modelKey?: string;
+    displayName?: string;
+    publisher?: string;
+    indexedModelIdentifier?: string;
+    maxContextLength?: number;
+  }>;
+
+  return modelsPayload
+    .filter((model) => typeof (model.modelKey ?? model.indexedModelIdentifier) === "string")
+    .map((model) => ({
+      id: String(model.modelKey ?? model.indexedModelIdentifier).trim(),
+      name: model.displayName?.trim() || String(model.modelKey ?? model.indexedModelIdentifier ?? "LM Studio model").trim(),
+      ownedBy: model.publisher,
+      contextLength: typeof model.maxContextLength === "number" ? model.maxContextLength : null,
+    }));
+}
+
+async function getGeminiModels(apiKey: string): Promise<GeminiModelSummary[]> {
+  const trimmedKey = apiKey.trim();
+  if (!trimmedKey) {
+    return [];
+  }
+
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&key=${encodeURIComponent(trimmedKey)}`);
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Gemini models failed: ${response.status} ${body}`);
+  }
+
+  const payload = (await response.json()) as {
+    models?: Array<{
+      name?: string;
+      displayName?: string;
+      description?: string;
+      inputTokenLimit?: number;
+      outputTokenLimit?: number;
+      supportedGenerationMethods?: string[];
+    }>;
+  };
+
+  const rawModels = payload.models ?? [];
+  const filteredModels = rawModels
+    .filter((model) => {
+      const id = String(model.name ?? "").replace(/^models\//, "");
+      const displayName = String(model.displayName ?? "").trim();
+      const description = String(model.description ?? "").trim();
+      const haystack = `${id} ${displayName} ${description}`.toLowerCase();
+      return (
+        /gemini/i.test(displayName) &&
+        (model.supportedGenerationMethods ?? []).includes("generateContent") &&
+        !/(?:embedding|embed|aqa|imagen|image generation|tts|speech)/i.test(haystack)
+      );
+    })
+    .map((model) => {
+      const id = String(model.name ?? "").replace(/^models\//, "").trim();
+      const haystack = `${model.name ?? ""} ${model.displayName ?? ""} ${model.description ?? ""}`.toLowerCase();
+      return {
+        id,
+        name: model.displayName?.trim() || id,
+        description: model.description?.trim(),
+        inputTokenLimit: typeof model.inputTokenLimit === "number" ? model.inputTokenLimit : null,
+        outputTokenLimit: typeof model.outputTokenLimit === "number" ? model.outputTokenLimit : null,
+        supportsImages: !/(?:text-only|text only)/i.test(haystack),
+      } satisfies GeminiModelSummary;
+    })
+    .sort(compareGeminiModelPriority);
+
+  console.log("[Gemini models] raw:", rawModels.length, "filtered:", filteredModels.length);
+  if (filteredModels.length === 0) {
+    console.log(
+      "[Gemini models] raw names:",
+      rawModels.map((model) => String(model.name ?? "")).filter(Boolean),
+    );
+  }
+
+  return filteredModels;
+}
+
+async function waitForLmStudioServer(maxWaitMs = 15000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < maxWaitMs) {
+    try {
+      const response = await fetch("http://127.0.0.1:1234/v1/models");
+      if (response.ok) {
+        return;
+      }
+    } catch {
+      // Keep waiting.
+    }
+    await delay(500);
+  }
+
+  throw new Error("LM Studio server did not become ready.");
+}
+
+function getDefaultLmStudioContextLength(totalMemoryBytes: number) {
+  const totalMemoryGb = totalMemoryBytes / 1024 / 1024 / 1024;
+  const reservedForSystemGb = Math.max(4, totalMemoryGb * 0.25);
+  const usableMemoryGb = Math.max(4, totalMemoryGb - reservedForSystemGb);
+  const estimatedContext = Math.floor(usableMemoryGb * 512);
+  const clampedContext = Math.max(4096, Math.min(32768, estimatedContext));
+  return Math.round(clampedContext / 1024) * 1024;
+}
+
+function normalizeLmStudioContextLength(value: number | undefined) {
+  if (!Number.isFinite(value)) {
+    return getDefaultLmStudioContextLength(os.totalmem());
+  }
+
+  return Math.max(1024, Math.round(value as number));
+}
+
+async function ensureLmStudioModelReady(model: string, contextLength?: number) {
+  const normalizedModel = model.trim().split("@")[0]?.trim() ?? "";
+  if (!normalizedModel) {
+    return;
+  }
+  const normalizedContextLength = normalizeLmStudioContextLength(contextLength);
+
+  const cliPath = path.join(process.env.USERPROFILE ?? "", ".lmstudio", "bin", "lms.exe");
+  try {
+    const response = await fetch("http://127.0.0.1:1234/v1/models");
+    if (!response.ok) {
+      throw new Error("LM Studio server is not reachable.");
+    }
+  } catch {
+    await execFileAsync(cliPath, ["server", "start"], {
+      windowsHide: true,
+      timeout: 15000,
+      maxBuffer: 1024 * 1024 * 2,
+    });
+    await waitForLmStudioServer();
+  }
+
+  await execFileAsync(
+    cliPath,
+    ["load", normalizedModel, "-c", String(normalizedContextLength), "-y"],
+    {
+      windowsHide: true,
+      timeout: 120000,
+      maxBuffer: 1024 * 1024 * 4,
+    },
+  );
+}
+
+async function getLoadedOllamaModels(): Promise<string[]> {
+  try {
+    const response = await fetch("http://127.0.0.1:11434/api/ps");
+    if (!response.ok) {
+      return [];
+    }
+
+    const payload = (await response.json()) as {
+      models?: Array<{
+        model?: string;
+        name?: string;
+      }>;
+    };
+
+    return (payload.models ?? [])
+      .map((model) => (model.model ?? model.name ?? "").trim())
+      .filter((model): model is string => model.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+async function unloadAllLmStudioModels() {
+  const cliPath = path.join(process.env.USERPROFILE ?? "", ".lmstudio", "bin", "lms.exe");
+  try {
+    await execFileAsync(cliPath, ["unload", "--all"], {
+      windowsHide: true,
+      timeout: 30000,
+      maxBuffer: 1024 * 1024 * 2,
+    });
+  } catch {
+    // Ignore unload failures. LM Studio may not be running or may already be empty.
+  }
 }
 
 async function unloadOllamaModel(model: string) {
@@ -446,10 +712,26 @@ async function unloadOllamaModel(model: string) {
 }
 
 async function unloadIdleOllamaModels(exceptModel?: string) {
-  const unloadTargets = [...knownOllamaModels].filter(
+  const loadedModels = await getLoadedOllamaModels();
+  const unloadTargets = [...new Set([...knownOllamaModels, ...loadedModels])].filter(
     (model) => model !== exceptModel && (activeOllamaRequestCounts.get(model) ?? 0) <= 0,
   );
   await Promise.all(unloadTargets.map((model) => unloadOllamaModel(model)));
+}
+
+async function cleanupLocalModels(provider?: ModelProvider, modelId?: string) {
+  if (provider === "ollama") {
+    await unloadIdleOllamaModels(modelId?.trim() || undefined);
+  } else {
+    await unloadIdleOllamaModels();
+  }
+
+  if (provider === "lmstudio" && modelId?.trim()) {
+    await unloadAllLmStudioModels();
+    await ensureLmStudioModelReady(modelId, undefined);
+  } else {
+    await unloadAllLmStudioModels();
+  }
 }
 
 function beginOllamaRequest(model: string) {
@@ -464,6 +746,31 @@ async function endOllamaRequest(model: string) {
   } else {
     activeOllamaRequestCounts.delete(model);
   }
+}
+
+function runShutdownCleanup() {
+  if (shutdownCleanupPromise) {
+    return shutdownCleanupPromise;
+  }
+
+  shutdownCleanupPromise = (async () => {
+    const loadedOllamaModels = await getLoadedOllamaModels();
+    await Promise.all([
+      ...[...new Set([...knownOllamaModels, ...loadedOllamaModels])].map((model) => unloadOllamaModel(model)),
+      unloadAllLmStudioModels(),
+    ]);
+  })()
+    .catch(() => {
+      // Ignore shutdown unload failures and continue quitting.
+    })
+    .then(() => {
+      didFinishShutdownCleanup = true;
+    })
+    .finally(() => {
+      isRunningShutdownCleanup = false;
+    });
+
+  return shutdownCleanupPromise;
 }
 
 async function readDirectoryTree(rootPath: string, depth = 0): Promise<Array<{
@@ -742,6 +1049,13 @@ app.whenReady().then(async () => {
       void unloadIdleOllamaModels();
     }
 
+    if (request.modelProvider === "lmstudio" && request.modelId) {
+      await unloadAllLmStudioModels();
+      await ensureLmStudioModelReady(request.modelId, request.lmStudioContextLength);
+    } else {
+      void unloadAllLmStudioModels();
+    }
+
     try {
       for await (const item of runAgentTask(request, agentToolHandlers, abortController.signal)) {
         if (event.sender.isDestroyed()) {
@@ -816,6 +1130,13 @@ app.whenReady().then(async () => {
       void unloadIdleOllamaModels();
     }
 
+    if (request.modelProvider === "lmstudio" && request.modelId) {
+      await unloadAllLmStudioModels();
+      await ensureLmStudioModelReady(request.modelId, request.lmStudioContextLength);
+    } else {
+      void unloadAllLmStudioModels();
+    }
+
     const events: AgentStreamEvent[] = [];
     try {
       for await (const item of runAgentTask(request, agentToolHandlers)) {
@@ -841,6 +1162,12 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle("agent:context-usage", async (_event, request: TaskRequest): Promise<ContextUsageSnapshot | null> => {
+    if (request.modelProvider === "lmstudio" && request.modelId) {
+      await unloadAllLmStudioModels();
+      await ensureLmStudioModelReady(request.modelId, request.lmStudioContextLength);
+    } else {
+      void unloadAllLmStudioModels();
+    }
     return buildContextUsageSnapshot(request);
   });
 
@@ -863,6 +1190,13 @@ app.whenReady().then(async () => {
     };
   });
 
+  ipcMain.handle("system:memory-info", async () => {
+    return {
+      totalMemoryBytes: os.totalmem(),
+      freeMemoryBytes: os.freemem(),
+    };
+  });
+
   ipcMain.handle("system:ollama-models", async () => {
     try {
       const models = await getOllamaModels();
@@ -877,6 +1211,48 @@ app.whenReady().then(async () => {
         error: error instanceof Error ? error.message : "Unknown Ollama error",
       };
     }
+  });
+
+  ipcMain.handle("system:lmstudio-models", async () => {
+    try {
+      const models = await getLmStudioModels();
+      return {
+        available: models.length > 0,
+        models,
+      };
+    } catch (error) {
+      return {
+        available: false,
+        models: [],
+        error: error instanceof Error ? error.message : "Unknown LM Studio error",
+      };
+    }
+  });
+
+  ipcMain.handle("system:gemini-models", async (_event, apiKey: string) => {
+    console.log("[Gemini models] IPC invoked", {
+      hasApiKey: Boolean(apiKey?.trim()),
+      apiKeyLength: apiKey?.trim().length ?? 0,
+    });
+    try {
+      const models = await getGeminiModels(apiKey);
+      return {
+        available: models.length > 0,
+        models,
+      };
+    } catch (error) {
+      console.error("Failed to fetch Gemini models:", error);
+      return {
+        available: false,
+        models: [],
+        error: error instanceof Error ? error.message : "Unknown Gemini error",
+      };
+    }
+  });
+
+  ipcMain.handle("system:cleanup-local-models", async (_event, payload: { provider?: ModelProvider; modelId?: string }) => {
+    await cleanupLocalModels(payload.provider, payload.modelId);
+    return { cleaned: true as const };
   });
 
   ipcMain.handle("system:workspace-info", async (event) => {
@@ -1010,7 +1386,24 @@ app.whenReady().then(async () => {
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
-    void Promise.all([...knownOllamaModels].map((model) => unloadOllamaModel(model)));
     app.quit();
   }
+});
+
+app.on("before-quit", (event) => {
+  if (didFinishShutdownCleanup) {
+    return;
+  }
+
+  if (isRunningShutdownCleanup) {
+    event.preventDefault();
+    return;
+  }
+
+  isRunningShutdownCleanup = true;
+  event.preventDefault();
+  BrowserWindow.getAllWindows().forEach((window) => window.hide());
+  void runShutdownCleanup().finally(() => {
+    app.exit(0);
+  });
 });
