@@ -567,6 +567,16 @@ function buildGenerateContentPayload(
       parts: [{ text: buildSystemInstruction(request, decision, retrieval) }],
     },
     ...(includeTools ? { tools: [{ functionDeclarations: FILE_TOOLS }] } : {}),
+    ...(includeTools
+      ? {
+          toolConfig: {
+            functionCallingConfig: {
+              mode: "AUTO",
+              allowedFunctionNames: FILE_TOOLS.map((tool) => tool.name),
+            },
+          },
+        }
+      : {}),
     contents,
   };
 }

@@ -115,7 +115,7 @@ textarea {
   content: "";
   position: absolute;
   inset: 0 auto 0 0;
-  width: 24px;
+  width: var(--file-handle-space);
   pointer-events: auto;
 }
 

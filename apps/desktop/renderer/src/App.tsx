@@ -3773,7 +3773,7 @@ export function App() {
       setSelectedFile({ path: node.path, content: "", missing: true });
       setCode("");
       setIsFileRailDismissed(true);
-      setCanRestoreFileRail(false);
+      setCanRestoreFileRail(true);
       return;
     }
     manualFileSelectionVersionRef.current += 1;
@@ -3781,7 +3781,7 @@ export function App() {
     setSelectedFile(preview);
     setCode(preview.content);
     setIsFileRailDismissed(true);
-    setCanRestoreFileRail(false);
+    setCanRestoreFileRail(true);
   }
 
   async function handleOpenDiffPath(path: string) {
@@ -3808,12 +3808,16 @@ export function App() {
       setShouldAutoOpenEditor(true);
       setSelectedFile({ path, content: "", missing: true });
       setCode("");
+      setIsFileRailDismissed(true);
+      setCanRestoreFileRail(true);
       return;
     }
     manualFileSelectionVersionRef.current += 1;
     setShouldAutoOpenEditor(true);
     setSelectedFile(preview);
     setCode(preview.content);
+    setIsFileRailDismissed(true);
+    setCanRestoreFileRail(true);
   }
 
   function handleCloseEditor() {
@@ -4682,7 +4686,7 @@ export function App() {
               <div className="browser-assist-copy">
                 <div className="browser-assist-summary">
                   <strong>{browserAssistPanel.request.helpNeeded}</strong>
-                  <span className="browser-assist-hint">???? ??? ??</span>
+                  <span className="browser-assist-hint">호버해서 자세히 보기</span>
                 </div>
                 <div className="browser-assist-details">
                   <p>{browserAssistPanel.request.description}</p>

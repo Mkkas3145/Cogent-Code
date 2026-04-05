@@ -1,5 +1,6 @@
 node_modules/
 release/
+release-alt/
 apps/dist/
 apps/dist-release/
 dist/
