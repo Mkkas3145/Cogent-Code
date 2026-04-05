@@ -112,6 +112,10 @@ type BrowserAssistPanelState = {
   visible: boolean;
 };
 
+type BrowserAssistFloatingPosition = {
+  left: number;
+  top: number;
+};
 
 type RenderItem =
   | {
@@ -566,8 +570,9 @@ function formatCustomStatusLabel(locale: Locale, label: string) {
     if (label.startsWith("Clicking ")) return "브라우저 클릭 중";
     if (label.startsWith("Scrolling page by ")) return "브라우저 스크롤 중";
     if (label.startsWith("Typing into ")) return "브라우저 입력 중";
-    if (label.startsWith("Pressing ")) return "키 입력 중";
+    if (label.startsWith("Pressing ")) return "키 누르는 중";
     if (label.startsWith("Dragging ")) return "드래그 중";
+    if (label === "Capturing browser screenshot") return "브라우저 캡처 중";
     if (label.startsWith("Exploring ")) return `${getPathLabel(label.slice("Exploring ".length))} 탐색 중`;
     if (label.startsWith("Writing ")) return `${getPathLabel(label.slice("Writing ".length))} 파일 수정 중`;
     if (label.startsWith("Creating ")) return `${getPathLabel(label.slice("Creating ".length))} 파일 생성 중`;
@@ -580,8 +585,9 @@ function formatCustomStatusLabel(locale: Locale, label: string) {
     if (label.startsWith("Clicking ")) return "ブラウザ?クリック中";
     if (label.startsWith("Scrolling page by ")) return "ブラウザ?スクロ?ル中";
     if (label.startsWith("Typing into ")) return "ブラウザ?入力中";
-    if (label.startsWith("Pressing ")) return "キ?入力中";
+    if (label.startsWith("Pressing ")) return "キー入力中";
     if (label.startsWith("Dragging ")) return "ドラッグ中";
+    if (label === "Capturing browser screenshot") return "ブラウザをキャプチャ中";
     if (label.startsWith("Exploring ")) return `${getPathLabel(label.slice("Exploring ".length))} を探索中`;
     if (label.startsWith("Writing ")) return `${getPathLabel(label.slice("Writing ".length))} を編集中`;
     if (label.startsWith("Creating ")) return `${getPathLabel(label.slice("Creating ".length))} を作成中`;
@@ -1770,6 +1776,11 @@ export function App() {
   const browserAssistStableRoundsRef = useRef(0);
   const browserAssistArmedRef = useRef(false);
   const browserAssistArmStableRoundsRef = useRef(0);
+  const browserAssistDragStateRef = useRef<{
+    pointerId: number;
+    offsetX: number;
+    offsetY: number;
+  } | null>(null);
   const sharedTypesLibLoadedRef = useRef(false);
   const monacoTypescriptConfiguredRef = useRef(false);
   const shouldFollowChatRef = useRef(true);
@@ -1779,6 +1790,16 @@ export function App() {
   const [isComposerDragActive, setIsComposerDragActive] = useState(false);
   const [isAgentRunning, setIsAgentRunning] = useState(false);
   const [browserAssistPanel, setBrowserAssistPanel] = useState<BrowserAssistPanelState | null>(null);
+  const [isBrowserAssistFloating, setIsBrowserAssistFloating] = useState(false);
+  const [browserAssistFloatingPosition, setBrowserAssistFloatingPosition] = useState<BrowserAssistFloatingPosition>({
+    left: 0,
+    top: 0,
+  });
+  const [browserAssistFloatingDisplayPosition, setBrowserAssistFloatingDisplayPosition] = useState<BrowserAssistFloatingPosition>({
+    left: 0,
+    top: 0,
+  });
+  const [isBrowserAssistDragging, setIsBrowserAssistDragging] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingMessageText, setEditingMessageText] = useState("");
   const [collapsedToolGroups, setCollapsedToolGroups] = useState<Record<string, boolean>>({});
@@ -2378,6 +2399,10 @@ export function App() {
             visible: false,
           });
           return;
+        }
+
+        if (event.type === "done") {
+          // no-op
         }
 
         if (event.type === "mode" || event.type === "retrieval" || event.type === "status") {
@@ -3157,19 +3182,12 @@ export function App() {
 
   useEffect(() => {
     const cogent = getCogent();
-    console.log("[Gemini models] effect fired", {
-      hasCogent: Boolean(cogent),
-      hasApiKey: Boolean(geminiApiKey.trim()),
-      apiKeyLength: geminiApiKey.trim().length,
-    });
     if (!cogent || !geminiApiKey.trim()) {
-      console.log("[Gemini models] skipped fetch");
       setGeminiModels([]);
       return;
     }
 
     let cancelled = false;
-    console.log("[Gemini models] invoking preload bridge");
     void cogent.getGeminiModels(geminiApiKey).then((result) => {
       if (cancelled) {
         return;
@@ -3179,14 +3197,17 @@ export function App() {
         console.error("[Gemini models] Failed to fetch model list:", result.error);
       }
 
-      console.log("[Gemini models] available:", result.available, "count:", result.models.length);
-
       setGeminiModels(result.models);
       if (result.models.length === 0) {
         setSelectedGeminiModel("");
         return;
       }
-      setSelectedGeminiModel(result.models[0].id);
+      const hasCurrentSelection = result.models.some(
+        (model) => model.id === selectedGeminiModel,
+      );
+      if (!hasCurrentSelection) {
+        setSelectedGeminiModel(result.models[0].id);
+      }
     });
 
     return () => {
@@ -3741,6 +3762,10 @@ export function App() {
             visible: false,
           });
           return;
+        }
+
+        if (event.type === "done") {
+          // no-op
         }
 
         if (event.type === "mode" || event.type === "retrieval" || event.type === "status") {
@@ -4441,10 +4466,84 @@ export function App() {
 
   function closeBrowserAssistPanel() {
     pendingBrowserAssistOpenRef.current = null;
+    setIsBrowserAssistFloating(false);
     setBrowserAssistPanel((current) => (current ? { ...current, visible: false } : current));
     window.setTimeout(() => {
       setBrowserAssistPanel((current) => (current && !current.visible ? null : current));
     }, 220);
+  }
+
+  function getBrowserAssistFloatingBounds() {
+    const width = 420;
+    const height = 280;
+    const margin = 20;
+    const titlebarHeight = 40;
+    const minLeft = margin + 56;
+    const maxLeft = Math.max(minLeft, window.innerWidth - width - margin - 56);
+    const minTop = titlebarHeight + margin;
+    const maxTop = Math.max(minTop, window.innerHeight - height - margin - 140);
+    return { width, height, minLeft, maxLeft, minTop, maxTop };
+  }
+
+  function resetBrowserAssistFloatingPosition() {
+    const bounds = getBrowserAssistFloatingBounds();
+    const nextPosition = {
+      left: bounds.maxLeft,
+      top: Math.min(bounds.maxTop, bounds.minTop + 24),
+    };
+    setBrowserAssistFloatingPosition(nextPosition);
+    setBrowserAssistFloatingDisplayPosition(nextPosition);
+  }
+
+  function handleToggleBrowserAssistFloating() {
+    setIsBrowserAssistFloating((current) => {
+      const next = !current;
+      if (next) {
+        resetBrowserAssistFloatingPosition();
+      }
+      return next;
+    });
+  }
+
+  function handleBrowserAssistFloatingPointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    if (!isBrowserAssistFloating) {
+      return;
+    }
+
+    setIsBrowserAssistDragging(true);
+    browserAssistDragStateRef.current = {
+      pointerId: event.pointerId,
+      offsetX: event.clientX - browserAssistFloatingDisplayPosition.left,
+      offsetY: event.clientY - browserAssistFloatingDisplayPosition.top,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function handleBrowserAssistFloatingPointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    const dragState = browserAssistDragStateRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId || !isBrowserAssistFloating) {
+      return;
+    }
+
+    const bounds = getBrowserAssistFloatingBounds();
+    const nextLeft = Math.min(bounds.maxLeft, Math.max(bounds.minLeft, event.clientX - dragState.offsetX));
+    const nextTop = Math.min(bounds.maxTop, Math.max(bounds.minTop, event.clientY - dragState.offsetY));
+    const nextPosition = { left: nextLeft, top: nextTop };
+    setBrowserAssistFloatingPosition(nextPosition);
+    setBrowserAssistFloatingDisplayPosition(nextPosition);
+  }
+
+  function handleBrowserAssistFloatingPointerEnd(event: React.PointerEvent<HTMLDivElement>) {
+    const dragState = browserAssistDragStateRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    browserAssistDragStateRef.current = null;
+    setIsBrowserAssistDragging(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
   }
 
   function handleOpenBrowserPanelLink(url: string, label?: string) {
@@ -4500,6 +4599,41 @@ export function App() {
       window.cancelAnimationFrame(frame);
     };
   }, [browserAssistPanel]);
+
+  useEffect(() => {
+    if (browserAssistPanel) {
+      resetBrowserAssistFloatingPosition();
+    }
+  }, [browserAssistPanel?.request.requestId]);
+
+  useEffect(() => {
+    if (!isBrowserAssistFloating || isBrowserAssistDragging) {
+      return;
+    }
+
+    let frame = 0;
+    const animate = () => {
+      setBrowserAssistFloatingDisplayPosition((current) => {
+        const nextLeft = current.left + (browserAssistFloatingPosition.left - current.left) * 0.18;
+        const nextTop = current.top + (browserAssistFloatingPosition.top - current.top) * 0.18;
+        const settled =
+          Math.abs(nextLeft - browserAssistFloatingPosition.left) < 0.5 &&
+          Math.abs(nextTop - browserAssistFloatingPosition.top) < 0.5;
+
+        if (settled) {
+          return browserAssistFloatingPosition;
+        }
+
+        frame = window.requestAnimationFrame(animate);
+        return { left: nextLeft, top: nextTop };
+      });
+    };
+
+    frame = window.requestAnimationFrame(animate);
+    return () => {
+      window.cancelAnimationFrame(frame);
+    };
+  }, [browserAssistFloatingPosition, isBrowserAssistFloating, isBrowserAssistDragging]);
 
   useEffect(() => {
     if (!browserAssistPanel) {
@@ -5396,20 +5530,50 @@ export function App() {
         </section>
 
         {browserAssistPanel ? (
-          <section className={`editor-stage browser-stage ${browserAssistPanel.visible ? "is-open" : "is-closing"}`} aria-label="Browser assistance">
+          <section
+            className={`editor-stage browser-stage ${browserAssistPanel.visible ? "is-open" : "is-closing"} ${isBrowserAssistFloating ? "is-floating" : ""} ${isBrowserAssistDragging ? "is-dragging" : ""}`}
+            aria-label="Browser assistance"
+            style={
+              isBrowserAssistFloating
+                ? {
+                    left: `${browserAssistFloatingDisplayPosition.left}px`,
+                    top: `${browserAssistFloatingDisplayPosition.top}px`,
+                    width: `${getBrowserAssistFloatingBounds().width}px`,
+                    height: `${getBrowserAssistFloatingBounds().height}px`,
+                  }
+                : undefined
+            }
+          >
             <div className="editor-shell browser-shell">
-              <div className="editor-toolbar browser-toolbar">
+              <div
+                className={`editor-toolbar browser-toolbar ${isBrowserAssistFloating ? "is-draggable" : ""}`}
+                onPointerDown={handleBrowserAssistFloatingPointerDown}
+                onPointerMove={handleBrowserAssistFloatingPointerMove}
+                onPointerUp={handleBrowserAssistFloatingPointerEnd}
+                onPointerCancel={handleBrowserAssistFloatingPointerEnd}
+              >
                 <div className="editor-meta browser-meta">
                   <span className="editor-name">{browserAssistPanel.request.title}</span>
                   <span className="editor-path">{browserAssistPanel.request.url}</span>
                 </div>
                 <div className="editor-actions">
+                  <button
+                    className="editor-close"
+                    onClick={handleToggleBrowserAssistFloating}
+                    aria-label={isBrowserAssistFloating ? "Expand browser help" : "Float browser help"}
+                  >
+                    {isBrowserAssistFloating ? (
+                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 30"><path d="M5.5 0C2.48 0 0 2.48 0 5.5v19C0 27.52 2.48 30 5.5 30h21c3.02 0 5.5-2.48 5.5-5.5v-19C32 2.48 29.52 0 26.5 0Zm0 3h21C27.898 3 29 4.102 29 5.5v19c0 1.398-1.102 2.5-2.5 2.5h-21A2.478 2.478 0 0 1 3 24.5v-19C3 4.102 4.102 3 5.5 3Z" /></svg>
+                    ) : (
+                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 30"><path d="M11.5 0a1.5 1.5 0 1 0 0 3h15C27.898 3 29 4.102 29 5.5v15a1.5 1.5 0 0 0 3 0v-15C32 2.48 29.52 0 26.5 0zM4.854 5C2.192 5 0 7.03 0 9.494v16.012C0 27.97 2.192 30 4.854 30h17.292C24.808 30 27 27.97 27 25.506V9.494C27 7.03 24.808 5 22.146 5zm0 2.887h17.292c.977 0 1.737.703 1.737 1.607v16.012c0 .904-.76 1.607-1.737 1.607H4.854c-.977 0-1.737-.703-1.737-1.607V9.494c0-.904.76-1.607 1.737-1.607z" /></svg>
+                    )}
+                  </button>
                   <button className="editor-close" onClick={closeBrowserAssistPanel} aria-label="Close browser help">
                     <svg xmlns="http://www.w3.org/2000/svg" xmlSpace="preserve" viewBox="0 0 32 32"><path d="M5.746 4.246a1.5 1.5 0 0 0-1.06.44 1.5 1.5 0 0 0 0 2.12L13.879 16l-9.193 9.193a1.5 1.5 0 0 0 0 2.121 1.5 1.5 0 0 0 2.12 0L16 18.121l9.193 9.193a1.5 1.5 0 0 0 2.121 0 1.5 1.5 0 0 0 0-2.12L18.121 16l9.193-9.193a1.5 1.5 0 0 0 0-2.121 1.5 1.5 0 0 0-1.06-.44 1.5 1.5 0 0 0-1.06.44L16 13.879 6.807 4.686a1.5 1.5 0 0 0-1.06-.44Z" /></svg>
                   </button>
                 </div>
               </div>
-              <div className="browser-assist-copy">
+              <div className={`browser-assist-copy ${isBrowserAssistFloating ? "is-floating" : ""}`}>
                 <div className="browser-assist-summary">
                   <strong>{browserAssistPanel.request.helpNeeded}</strong>
                   <span className="browser-assist-hint">호버해서 자세히 보기</span>

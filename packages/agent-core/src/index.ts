@@ -647,7 +647,7 @@ function buildGenerateContentPayload(
       ? {
           toolConfig: {
             functionCallingConfig: {
-              mode: "AUTO",
+              mode: "ANY",
               allowedFunctionNames: FILE_TOOLS.map((tool) => tool.name),
             },
           },
@@ -667,6 +667,9 @@ function buildSystemInstruction(request: TaskRequest, decision: ModeDecision, re
     "Prefer read_file, list_dir, write_file, create_file, delete_file, and delete_directory over shell commands whenever they can accomplish the task.",
     "Use web_search to find current information on the public web and open_webpage when you need the actual rendered contents of a page, including client-side content.",
     "After opening a page, you may use web_click, web_scroll, web_type, web_press, and web_drag to interact with the page when needed.",
+    "For browser selectors, avoid brittle generated class selectors such as css-xxxxx whenever possible.",
+    "Prefer stable semantic selectors based on name, id, role, aria-label, placeholder, href, type, or other durable attributes over transient styling classes.",
+    "If a browser selector fails, reconsider the selector and page state instead of repeating the same brittle selector blindly.",
     "If a browser task requires a real person, such as login, captcha, consent, or visually guided confirmation, use request_browser_assistance with a clear title, reason, helpNeeded summary, and detailed ordered steps.",
     "Browser assistance results are only candidate observations. You must decide yourself whether the browser task is truly complete from the returned page snapshot.",
     "Only treat a browser-assisted task as complete when you are highly confident from the actual screen contents that the requested goal was really reached. If there is any real doubt, do not say it is done yet.",

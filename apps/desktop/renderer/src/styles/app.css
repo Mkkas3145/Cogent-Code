@@ -761,6 +761,28 @@ textarea {
   z-index: 19;
 }
 
+.browser-stage.is-floating {
+  right: auto;
+  bottom: auto;
+  left: 0;
+  top: 0;
+  transform: none;
+  transition: opacity 0.18s ease;
+}
+
+.browser-stage.is-floating.is-dragging {
+  transition: opacity 0.18s ease;
+}
+
+.browser-stage.is-floating.is-closing {
+  opacity: 0;
+}
+
+.browser-stage.is-floating .browser-shell {
+  border-radius: 14px;
+  box-shadow: none;
+}
+
 .browser-shell {
   background: #101112;
 }
@@ -769,6 +791,20 @@ textarea {
   align-items: flex-start;
   padding-top: 10px;
   padding-bottom: 10px;
+}
+
+.browser-toolbar.is-draggable {
+  cursor: grab;
+}
+
+.browser-toolbar.is-draggable:active {
+  cursor: grabbing;
+}
+
+.browser-toolbar.is-draggable .editor-meta,
+.browser-toolbar.is-draggable .editor-name,
+.browser-toolbar.is-draggable .editor-path {
+  user-select: none;
 }
 
 .browser-meta {
@@ -784,6 +820,11 @@ textarea {
   overflow: visible;
   min-height: 52px;
   transition: background-color 0.22s ease;
+}
+
+.browser-assist-copy.is-floating {
+  padding: 10px 14px;
+  min-height: 44px;
 }
 
 .browser-assist-copy:hover {
@@ -864,6 +905,17 @@ textarea {
   height: 100%;
   border: 0;
   display: flex;
+}
+
+.browser-automation-preview-image {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+  user-select: none;
+  -webkit-user-drag: none;
+  pointer-events: none;
+  background: #0b0c0d;
 }
 
 .chat-column {

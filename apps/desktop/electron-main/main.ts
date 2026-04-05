@@ -55,6 +55,139 @@ function delay(ms: number) {
   });
 }
 
+function buildResolveElementScript(selector: string, options?: { focus?: boolean; clear?: boolean }) {
+  return `
+    (() => {
+      const selector = ${JSON.stringify(selector)};
+      const shouldFocus = ${options?.focus ? "true" : "false"};
+      const shouldClear = ${options?.clear ? "true" : "false"};
+
+      const normalize = (value) =>
+        String(value ?? "")
+          .replace(/\\s+/g, " ")
+          .trim()
+          .toLowerCase();
+
+      const isVisible = (element) => {
+        if (!element) return false;
+        const bounds = element.getBoundingClientRect();
+        if (bounds.width <= 0 || bounds.height <= 0) return false;
+        const style = window.getComputedStyle(element);
+        return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
+      };
+
+      const getScore = (element, attributes, needle) => {
+        const normalizedNeedle = normalize(needle);
+        if (!normalizedNeedle) return 0;
+        let best = 0;
+
+        for (let index = 0; index < attributes.length; index += 1) {
+          const attribute = attributes[index];
+          const value =
+            attribute === "text"
+              ? normalize(element.textContent)
+              : normalize(element.getAttribute?.(attribute) ?? element[attribute]);
+
+          if (!value) continue;
+          const attrPenalty = index * 7;
+          if (value === normalizedNeedle) {
+            best = Math.max(best, 100 - attrPenalty);
+          } else if (value.includes(normalizedNeedle)) {
+            best = Math.max(best, 82 - attrPenalty);
+          } else if (normalizedNeedle.includes(value)) {
+            best = Math.max(best, 72 - attrPenalty);
+          }
+        }
+
+        if (isVisible(element)) {
+          best += 5;
+        }
+
+        return best;
+      };
+
+      const pickBestMatch = (tagName, primaryAttribute, rawValue) => {
+        const tagSelector = tagName && tagName !== "*" ? tagName : "*";
+        const candidates = Array.from(document.querySelectorAll(tagSelector));
+        const attributePriority = {
+          placeholder: ["placeholder", "aria-label", "name", "id", "text"],
+          "aria-label": ["aria-label", "placeholder", "name", "id", "text"],
+          name: ["name", "placeholder", "aria-label", "id", "text"],
+          id: ["id", "name", "aria-label", "placeholder", "text"],
+          title: ["title", "aria-label", "placeholder", "text"],
+          value: ["value", "placeholder", "aria-label", "text"],
+          role: ["role", "aria-label", "text"],
+          type: ["type", "name", "aria-label", "placeholder", "text"],
+        };
+
+        const attributes = attributePriority[primaryAttribute] ?? [primaryAttribute, "aria-label", "placeholder", "name", "id", "text"];
+        let bestElement = null;
+        let bestScore = 0;
+
+        for (const element of candidates) {
+          const score = getScore(element, attributes, rawValue);
+          if (score > bestScore) {
+            bestScore = score;
+            bestElement = element;
+          }
+        }
+
+        return bestScore >= 70 ? bestElement : null;
+      };
+
+      let element = null;
+
+      try {
+        element = document.querySelector(selector);
+      } catch {
+        element = null;
+      }
+
+      if (!isVisible(element)) {
+        element = null;
+      }
+
+      if (!element) {
+        const exactAttributeMatch = selector.match(/^\\s*([a-zA-Z0-9_*:-]+)?\\[(placeholder|aria-label|name|id|type|role|title|value)=['"](.+?)['"]\\]\\s*$/i);
+        if (exactAttributeMatch) {
+          const [, tagName = "*", attributeName, rawValue] = exactAttributeMatch;
+          element = pickBestMatch(tagName, attributeName.toLowerCase(), rawValue);
+        }
+      }
+
+      if (!element) {
+        const embeddedAttributeMatch = selector.match(/(placeholder|aria-label|name|id|type|role|title|value)=['"](.+?)['"]/i);
+        if (embeddedAttributeMatch) {
+          const [, attributeName, rawValue] = embeddedAttributeMatch;
+          element = pickBestMatch("*", attributeName.toLowerCase(), rawValue);
+        }
+      }
+
+      if (!element || !isVisible(element)) {
+        return null;
+      }
+
+      if (shouldFocus) {
+        if (shouldClear) {
+          if ("value" in element) {
+            element.value = "";
+          }
+          if (element.isContentEditable) {
+            element.textContent = "";
+          }
+        }
+        element.focus();
+      }
+
+      const bounds = element.getBoundingClientRect();
+      return {
+        x: Math.round(bounds.left + bounds.width / 2),
+        y: Math.round(bounds.top + bounds.height / 2),
+      };
+    })();
+  `;
+}
+
 function compareGeminiModelPriority(left: GeminiModelSummary, right: GeminiModelSummary) {
   const tokenize = (value: string) =>
     value
@@ -242,22 +375,36 @@ function createBrowserAutomationSession() {
     return browser;
   }
 
+  function getExistingBrowser() {
+    if (browser && !browser.isDestroyed()) {
+      return browser;
+    }
+    return null;
+  }
+
+  async function waitForSelector(
+    webContents: Electron.WebContents,
+    selector: string,
+    timeoutMs = 3000,
+  ) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const rect = await webContents.executeJavaScript(buildResolveElementScript(selector));
+
+      if (rect && typeof rect.x === "number" && typeof rect.y === "number") {
+        return rect;
+      }
+
+      await delay(200);
+    }
+
+    return null;
+  }
+
   async function getElementCenter(selector: string) {
     const activeBrowser = await ensureBrowser();
     const webContents = activeBrowser.webContents;
-    const rect = await webContents.executeJavaScript(`
-      (() => {
-        const element = document.querySelector(${JSON.stringify(selector)});
-        if (!element) {
-          return null;
-        }
-        const bounds = element.getBoundingClientRect();
-        return {
-          x: Math.round(bounds.left + bounds.width / 2),
-          y: Math.round(bounds.top + bounds.height / 2),
-        };
-      })();
-    `);
+    const rect = await waitForSelector(webContents, selector);
 
     if (!rect || typeof rect.x !== "number" || typeof rect.y !== "number") {
       throw new Error(`Web element not found for selector: ${selector}`);
@@ -306,31 +453,25 @@ function createBrowserAutomationSession() {
     },
     async scroll(deltaY: number) {
       const activeBrowser = await ensureBrowser();
-      await activeBrowser.webContents.executeJavaScript(`window.scrollBy({ top: ${JSON.stringify(deltaY)}, behavior: 'instant' });`);
+      await activeBrowser.webContents.executeJavaScript(`window.scrollBy(0, ${JSON.stringify(deltaY)});`);
       await waitForPageSettled(activeBrowser.webContents, { minWaitMs: 300, maxWaitMs: 10000, stableRounds: 2 });
       return { deltaY, scrolled: true as const };
     },
     async type(selector: string, text: string, clear = true) {
       const activeBrowser = await ensureBrowser();
       const webContents = activeBrowser.webContents;
-      const focused = await webContents.executeJavaScript(`
-        (() => {
-          const element = document.querySelector(${JSON.stringify(selector)});
-          if (!element) {
-            return false;
-          }
-          if (${clear ? "true" : "false"}) {
-            if ('value' in element) {
-              element.value = '';
-            }
-            if (element.isContentEditable) {
-              element.textContent = '';
-            }
-          }
-          element.focus();
-          return true;
-        })();
-      `);
+      let focused = false;
+      const deadline = Date.now() + 3000;
+      while (!focused && Date.now() < deadline) {
+        focused = Boolean(
+          await webContents.executeJavaScript(
+            buildResolveElementScript(selector, { focus: true, clear }),
+          ),
+        );
+        if (!focused) {
+          await delay(200);
+        }
+      }
       if (!focused) {
         throw new Error(`Web element not found for selector: ${selector}`);
       }
@@ -399,6 +540,28 @@ function createBrowserAutomationSession() {
         browser.destroy();
       }
       browser = null;
+    },
+    async getCurrentPreview() {
+      const activeBrowser = getExistingBrowser();
+      if (!activeBrowser) {
+        return null;
+      }
+      const [meta, image] = await Promise.all([
+        activeBrowser.webContents.executeJavaScript(`
+          (() => ({
+            url: location.href,
+            title: document.title || location.href,
+            width: window.innerWidth || document.documentElement.clientWidth || 0,
+            height: window.innerHeight || document.documentElement.clientHeight || 0,
+          }))();
+        `) as Promise<{ url: string; title: string; width: number; height: number }>,
+        activeBrowser.webContents.capturePage(),
+      ]);
+
+      return {
+        ...meta,
+        imageDataUrl: `data:image/png;base64,${image.toPNG().toString("base64")}`,
+      };
     },
   };
 }
@@ -574,14 +737,6 @@ async function getGeminiModels(apiKey: string): Promise<GeminiModelSummary[]> {
       } satisfies GeminiModelSummary;
     })
     .sort(compareGeminiModelPriority);
-
-  console.log("[Gemini models] raw:", rawModels.length, "filtered:", filteredModels.length);
-  if (filteredModels.length === 0) {
-    console.log(
-      "[Gemini models] raw names:",
-      rawModels.map((model) => String(model.name ?? "")).filter(Boolean),
-    );
-  }
 
   return filteredModels;
 }
@@ -887,9 +1042,8 @@ app.whenReady().then(async () => {
     console.log("GPU feature status:", app.getGPUFeatureStatus());
   });
 
-  const createAgentToolHandlers = (rootPath: string, sender: Electron.WebContents) => {
+  const createAgentToolHandlers = (rootPath: string, sender: Electron.WebContents, eventChannel?: string) => {
     const browserSession = createBrowserAutomationSession();
-
     return {
     readFile: async (targetPath: string) => {
       const resolvedPath = resolveToolPath(targetPath, rootPath);
@@ -1038,7 +1192,7 @@ app.whenReady().then(async () => {
     const eventChannel = `agent:run-task-stream:${requestId}`;
     const doneChannel = `agent:run-task-stream:${requestId}:done`;
     const abortController = new AbortController();
-    const agentToolHandlers = createAgentToolHandlers(request.workspaceRoot || workspaceRoot, event.sender);
+    const agentToolHandlers = createAgentToolHandlers(request.workspaceRoot || workspaceRoot, event.sender, eventChannel);
     activeAgentRuns.set(requestId, abortController);
     const ollamaModel = request.modelProvider === "ollama" ? request.modelId?.trim() || "llama3:latest" : null;
 
@@ -1230,10 +1384,6 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle("system:gemini-models", async (_event, apiKey: string) => {
-    console.log("[Gemini models] IPC invoked", {
-      hasApiKey: Boolean(apiKey?.trim()),
-      apiKeyLength: apiKey?.trim().length ?? 0,
-    });
     try {
       const models = await getGeminiModels(apiKey);
       return {
