@@ -2203,61 +2203,11 @@ async function* runGeminiAgentLoop(
 
     yield { type: "status", label: turn === 0 ? "Loading" : "Thinking" };
 
-    // Single streaming call with tools enabled — eliminates the previous double-request pattern.
-    let streamedAggregatedText = "";
-    let emittedMessageLength = 0;
-    let emittedCodeLength = 0;
-    let streamedCandidate: GeminiCandidate = {};
-    let hasFence = false;
-
-    for await (const chunk of requestGeminiStreamWithRetry(request, decision, retrieval, currentContents, true, signal)) {
-      if (signal?.aborted) {
-        yield { type: "done", summary: "Agent request canceled." };
-        return;
-      }
-
-      if (chunk.type === "text") {
-        streamedAggregatedText += chunk.delta;
-        // Only scan the new delta for a fence, not the entire accumulated string (O(n) → O(delta)).
-        if (!hasFence) hasFence = chunk.delta.includes("```");
-
-        if (hasFence) {
-          const streamedParts = splitResponseParts(streamedAggregatedText);
-          if (streamedParts.message.length > emittedMessageLength) {
-            const nextMessageChunk = streamedParts.message.slice(emittedMessageLength);
-            emittedMessageLength = streamedParts.message.length;
-            yield { type: "message", chunk: nextMessageChunk };
-          }
-          if (streamedParts.code.length > emittedCodeLength) {
-            const nextCodeChunk = streamedParts.code.slice(emittedCodeLength);
-            emittedCodeLength = streamedParts.code.length;
-            yield { type: "code", chunk: nextCodeChunk };
-          }
-        } else {
-          // Fast path: no code fence detected yet — emit delta directly.
-          yield { type: "message", chunk: chunk.delta };
-          emittedMessageLength += chunk.delta.length;
-        }
-      } else {
-        streamedCandidate = chunk.candidate;
-      }
-    }
-
-    const parts = streamedCandidate.content?.parts ?? [];
+    // Non-streaming call to detect tool/finish calls quickly and reliably.
+    // Streaming is only used below when the model returns a plain text response.
+    const candidate = await requestGeminiWithRetry(request, decision, retrieval, currentContents, signal);
+    const parts = candidate.content?.parts ?? [];
     const functionCalls = getFunctionCalls(parts);
-
-    // Flush any remaining content surfaced in the final candidate.
-    const finalText = getTextFromParts(parts);
-    if (finalText) {
-      const finalParts = splitResponseParts(finalText);
-      if (finalParts.message.length > emittedMessageLength) {
-        yield { type: "message", chunk: finalParts.message.slice(emittedMessageLength) };
-        emittedMessageLength = finalParts.message.length;
-      }
-      if (finalParts.code.length > emittedCodeLength) {
-        yield { type: "code", chunk: finalParts.code.slice(emittedCodeLength) };
-      }
-    }
 
     const finishCall = functionCalls.find((call) => call.name === "finish_turn");
     if (finishCall) {
@@ -2276,9 +2226,58 @@ async function* runGeminiAgentLoop(
     }
 
     if (functionCalls.length === 0) {
+      // No tool calls — stream the response for better UX (incremental text delivery).
+      let streamedAggregatedText = "";
+      let emittedMessageLength = 0;
+      let emittedCodeLength = 0;
+      let streamedCandidate: GeminiCandidate = candidate;
+      let hasFence = false;
+
+      for await (const chunk of requestGeminiStreamWithRetry(request, decision, retrieval, currentContents, false, signal)) {
+        if (signal?.aborted) {
+          yield { type: "done", summary: "Agent request canceled." };
+          return;
+        }
+
+        if (chunk.type === "text") {
+          streamedAggregatedText += chunk.delta;
+          // Only scan the new delta for a fence — avoids O(n²) rescanning.
+          if (!hasFence) hasFence = chunk.delta.includes("```");
+
+          if (hasFence) {
+            const streamedParts = splitResponseParts(streamedAggregatedText);
+            if (streamedParts.message.length > emittedMessageLength) {
+              const nextMessageChunk = streamedParts.message.slice(emittedMessageLength);
+              emittedMessageLength = streamedParts.message.length;
+              yield { type: "message", chunk: nextMessageChunk };
+            }
+            if (streamedParts.code.length > emittedCodeLength) {
+              const nextCodeChunk = streamedParts.code.slice(emittedCodeLength);
+              emittedCodeLength = streamedParts.code.length;
+              yield { type: "code", chunk: nextCodeChunk };
+            }
+          } else {
+            // Fast path: no fence yet — emit delta directly.
+            yield { type: "message", chunk: chunk.delta };
+            emittedMessageLength += chunk.delta.length;
+          }
+        } else {
+          streamedCandidate = chunk.candidate;
+        }
+      }
+
+      const aggregatedText = getTextFromParts(streamedCandidate.content?.parts ?? parts);
+      const finalParts = splitResponseParts(aggregatedText);
+      if (finalParts.message.length > emittedMessageLength) {
+        yield { type: "message", chunk: finalParts.message.slice(emittedMessageLength) };
+      }
+      if (finalParts.code.length > emittedCodeLength) {
+        yield { type: "code", chunk: finalParts.code.slice(emittedCodeLength) };
+      }
+
       currentContents.push({
         role: "model",
-        parts: parts.length > 0 ? parts : [{ text: streamedAggregatedText }],
+        parts: streamedCandidate.content?.parts ?? parts,
       });
       yield { type: "done", summary: "Agent turn completed." };
       return;
