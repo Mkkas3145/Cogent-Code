@@ -599,6 +599,145 @@ const FILE_TOOLS = [
   },
 ];
 
+const VERIFICATION_TOOL_NAMES = new Set(["read_file", "list_dir", "run_command"]);
+
+const VERIFICATION_TOOLS = [
+  ...FILE_TOOLS.filter((t) => VERIFICATION_TOOL_NAMES.has(t.name)),
+  {
+    name: "submit_verification",
+    description:
+      "Submit the final verification result after inspecting the completed work. Call this once you have enough evidence to make a judgement.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        passed: {
+          type: "BOOLEAN",
+          description: "true if the work correctly satisfies the original request, false otherwise.",
+        },
+        issues: {
+          type: "STRING",
+          description: "Specific problems found. Empty string if passed.",
+        },
+        recommendation: {
+          type: "STRING",
+          description: "Concrete steps the agent should take to fix the issues. Empty string if passed.",
+        },
+      },
+      required: ["passed", "issues", "recommendation"],
+    },
+  },
+];
+
+type VerificationResult = { passed: boolean; issues: string; recommendation: string };
+
+function buildVerificationSystemInstruction(originalRequest: string, completionSummary: string): string {
+  return [
+    "You are a verification agent. Your only job is to check whether the completed work actually satisfies the original request.",
+    "Use read_file, list_dir, and run_command to inspect the current state — do NOT make any changes.",
+    "Focus on concrete evidence: does the code build, do the right files exist, does the behavior match the request?",
+    "Be fair but honest. Pass if the core requirement is met even if minor style issues exist. Fail only for real functional problems.",
+    "Once you have enough evidence, call submit_verification with your verdict.",
+    `Original request:\n${originalRequest}`,
+    completionSummary ? `What the agent claims to have done:\n${completionSummary}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+async function runGeminiVerificationPass(
+  request: TaskRequest,
+  originalRequest: string,
+  completionSummary: string,
+  mutatedPaths: string[],
+  handlers: ToolHandlers,
+  signal?: AbortSignal,
+): Promise<VerificationResult> {
+  if (!request.apiKey?.trim()) return { passed: true, issues: "", recommendation: "" };
+
+  const systemInstruction = buildVerificationSystemInstruction(originalRequest, completionSummary);
+  const pathsHint = mutatedPaths.length > 0 ? `\nFiles that were modified: ${mutatedPaths.join(", ")}` : "";
+  let currentContents: GeminiContent[] = [
+    {
+      role: "user",
+      parts: [
+        {
+          text: `Please verify that the following task was completed correctly.${pathsHint}\n\nOriginal request: ${originalRequest}\n\nCompletion summary: ${completionSummary || "(no summary provided)"}`,
+        },
+      ],
+    },
+  ];
+
+  const MAX_VERIFICATION_TURNS = 6;
+
+  for (let turn = 0; turn < MAX_VERIFICATION_TURNS; turn++) {
+    let response: Response;
+    try {
+      response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${getEffectiveModelName(request)}:generateContent`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": request.apiKey.trim() },
+          signal,
+          body: JSON.stringify({
+            system_instruction: { parts: [{ text: systemInstruction }] },
+            tools: [{ functionDeclarations: VERIFICATION_TOOLS }],
+            toolConfig: {
+              functionCallingConfig: {
+                mode: "ANY",
+                allowedFunctionNames: VERIFICATION_TOOLS.map((t) => t.name),
+              },
+            },
+            generationConfig: { thinkingConfig: { thinkingBudget: 0 } },
+            contents: currentContents,
+          }),
+        },
+      );
+    } catch {
+      return { passed: true, issues: "", recommendation: "" };
+    }
+
+    if (!response.ok) return { passed: true, issues: "", recommendation: "" };
+
+    const parsed = (await response.json()) as { candidates?: GeminiCandidate[] };
+    const candidate = parsed.candidates?.[0];
+    const parts = candidate?.content?.parts ?? [];
+    const functionCalls = getFunctionCalls(parts);
+
+    const submitCall = functionCalls.find((c) => c.name === "submit_verification");
+    if (submitCall) {
+      return {
+        passed: submitCall.args.passed === true,
+        issues: typeof submitCall.args.issues === "string" ? submitCall.args.issues : "",
+        recommendation: typeof submitCall.args.recommendation === "string" ? submitCall.args.recommendation : "",
+      };
+    }
+
+    if (functionCalls.length === 0) break;
+
+    currentContents.push({ role: "model", parts });
+
+    const responseParts: GeminiPart[] = [];
+    for (const call of functionCalls.filter((c) => VERIFICATION_TOOL_NAMES.has(c.name))) {
+      let toolPart: GeminiPart;
+      try {
+        const gen = executeToolCall(call, handlers);
+        while (true) {
+          const { done, value } = await gen.next();
+          if (done) { toolPart = value; break; }
+          // Discard intermediate status events — verification runs silently.
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        toolPart = { functionResponse: { name: call.name, response: { error: message } } };
+      }
+      responseParts.push(toolPart!);
+    }
+    currentContents.push({ role: "user", parts: responseParts });
+  }
+
+  return { passed: true, issues: "", recommendation: "" };
+}
+
 const OLLAMA_TOOL_DEFINITIONS = FILE_TOOLS.map((tool) => ({
   type: "function",
   function: {
@@ -2594,29 +2733,88 @@ export async function* runAgentTask(
     return;
   }
 
-  try {
-    if (getModelProvider(request) === "ollama") {
-      yield* runOllamaAgentLoop(request, decision, retrieval, handlers, signal);
-    } else if (getModelProvider(request) === "lmstudio") {
-      yield* runLmStudioAgentLoop(request, decision, retrieval, handlers, signal);
-    } else {
-      yield* runGeminiAgentLoop(request, decision, retrieval, handlers, signal);
-    }
-  } catch (error) {
-    if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
-      yield { type: "done", summary: "Agent request canceled." };
+  const provider = getModelProvider(request);
+  const MAX_FIX_ROUNDS = 1; // one verification + one fix attempt
+  let currentRequest = request;
+
+  for (let round = 0; round <= MAX_FIX_ROUNDS; round++) {
+    let completionSummary = "";
+    let mutatedPaths: string[] = [];
+    let hadMutations = false;
+
+    try {
+      const loop =
+        provider === "ollama"
+          ? runOllamaAgentLoop(currentRequest, decision, retrieval, handlers, signal)
+          : provider === "lmstudio"
+            ? runLmStudioAgentLoop(currentRequest, decision, retrieval, handlers, signal)
+            : runGeminiAgentLoop(currentRequest, decision, retrieval, handlers, signal);
+
+      for await (const event of loop) {
+        if (event.type === "done") {
+          completionSummary = event.summary;
+        }
+        if (event.type === "file-write") {
+          hadMutations = true;
+          if (!mutatedPaths.includes(event.path)) mutatedPaths.push(event.path);
+        }
+        yield event;
+      }
+    } catch (error) {
+      if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
+        yield { type: "done", summary: "Agent request canceled." };
+        return;
+      }
+      const providerLabel = provider === "ollama" ? "Ollama" : provider === "lmstudio" ? "LM Studio" : "Gemini";
+      const message = error instanceof Error ? error.message : `Unknown ${providerLabel} error`;
+      yield { type: "message", chunk: `${providerLabel} request failed: ${message}` };
+      yield { type: "done", summary: `${providerLabel} request failed.` };
       return;
     }
 
-    const providerLabel =
-      getModelProvider(request) === "ollama"
-        ? "Ollama"
-        : getModelProvider(request) === "lmstudio"
-          ? "LM Studio"
-          : "Gemini";
-    const message = error instanceof Error ? error.message : `Unknown ${providerLabel} error`;
-    yield { type: "message", chunk: `${providerLabel} request failed: ${message}` };
-    yield { type: "done", summary: `${providerLabel} request failed.` };
+    // Verification only runs for Gemini, only when file mutations happened, and not on the final round.
+    if (round >= MAX_FIX_ROUNDS || !hadMutations || provider !== "gemini" || !currentRequest.apiKey?.trim()) break;
+    if (signal?.aborted) break;
+
+    yield { type: "status", label: "Verifying" };
+
+    let verResult: VerificationResult;
+    try {
+      verResult = await runGeminiVerificationPass(
+        currentRequest,
+        request.prompt,
+        completionSummary,
+        mutatedPaths,
+        handlers,
+        signal,
+      );
+    } catch {
+      break; // verification error — treat as passed to not block the user
+    }
+
+    if (verResult.passed) break;
+
+    // Verification failed — feed issues back for a fix round.
+    yield { type: "status", label: "Fixing issues found during verification" };
+
+    currentRequest = {
+      ...currentRequest,
+      conversation: [
+        ...(currentRequest.conversation ?? []),
+        {
+          role: "assistant" as const,
+          text: completionSummary || "Work completed.",
+          images: [],
+          files: [],
+        },
+        {
+          role: "user" as const,
+          text: `The verification agent reviewed your work and found issues. Please fix them.\n\nIssues: ${verResult.issues}\n\nRecommendation: ${verResult.recommendation}`,
+          images: [],
+          files: [],
+        },
+      ],
+    };
   }
 }
 
