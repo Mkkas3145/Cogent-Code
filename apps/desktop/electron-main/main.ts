@@ -1,6 +1,7 @@
 ﻿import { app, BrowserWindow, dialog, ipcMain } from "electron";
 import { execFile } from "node:child_process";
-import { mkdir, readFile, readdir, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import http from "node:http";
+import { mkdir, readFile, readdir, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -46,6 +47,13 @@ const pendingBrowserAssistRequests = new Map<
     reject: (error: Error) => void;
   }
 >();
+const pendingCommandReviewRequests = new Map<
+  string,
+  {
+    senderId: number;
+    resolve: (result: { approved: boolean }) => void;
+  }
+>();
 const activeCommandSessions = new Map<
   string,
   {
@@ -54,6 +62,15 @@ const activeCommandSessions = new Map<
     command: string;
     stdout: string;
     stderr: string;
+  }
+>();
+const activeFlutterSessions = new Map<
+  string,
+  {
+    process: ChildProcessWithoutNullStreams;
+    pid: number | null;
+    vmServiceUrl: string | null;
+    log: string;
   }
 >();
 const preloadPath = isDev
@@ -240,6 +257,177 @@ async function runPowerShellJson<T>(script: string): Promise<T> {
 
   return JSON.parse(trimmed) as T;
 }
+
+// ── Flutter helpers ──────────────────────────────────────────────────────────
+
+const WIN_INPUT_TYPE_DEF = `
+using System; using System.Runtime.InteropServices;
+public class WI {
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, uint d, IntPtr e);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, ref RECT r);
+  [DllImport("user32.dll")] public static extern IntPtr SetForegroundWindow(IntPtr h);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+}`.trim();
+
+async function runPowerShellVoid(script: string): Promise<void> {
+  await execFileAsync("powershell.exe", [
+    "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script,
+  ]);
+}
+
+async function startFlutterRun(projectPath: string, device?: string): Promise<{
+  sessionId: string;
+  pid: number | null;
+  vmServiceUrl: string | null;
+}> {
+  const deviceFlag = device ? ` -d ${device}` : "";
+  const child = createShellChild(`flutter run${deviceFlag}`, projectPath);
+
+  const sessionId = `flutter-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const session = {
+    process: child,
+    pid: child.pid ?? null,
+    vmServiceUrl: null as string | null,
+    log: "",
+  };
+
+  child.stdout.on("data", (data: string) => {
+    session.log = `${session.log}${data}`.slice(-100_000);
+  });
+  child.stderr.on("data", (data: string) => {
+    session.log = `${session.log}${data}`.slice(-100_000);
+  });
+
+  activeFlutterSessions.set(sessionId, session);
+  child.once("close", () => {
+    activeFlutterSessions.delete(sessionId);
+  });
+
+  const vmUrlPattern =
+    /(?:Observatory listening on|A Dart VM Service is listening on|An Observatory debugger[^:]*:)\s+(http:\/\/[^\s]+)/;
+
+  const vmServiceUrl = await new Promise<string | null>((resolve) => {
+    let resolved = false;
+    const done = (url: string | null) => {
+      if (!resolved) { resolved = true; resolve(url); }
+    };
+
+    const timeout = setTimeout(() => done(null), 90_000);
+
+    child.stdout.on("data", () => {
+      const match = session.log.match(vmUrlPattern);
+      if (match) { clearTimeout(timeout); done(match[1]); }
+    });
+    child.stderr.on("data", () => {
+      const match = session.log.match(vmUrlPattern);
+      if (match) { clearTimeout(timeout); done(match[1]); }
+    });
+    child.once("close", () => { clearTimeout(timeout); done(null); });
+  });
+
+  session.vmServiceUrl = vmServiceUrl;
+  return { sessionId, pid: session.pid, vmServiceUrl };
+}
+
+async function callFlutterVmService(vmServiceUrl: string, method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+  const url = new URL(vmServiceUrl);
+  const body = JSON.stringify({ jsonrpc: "2.0", id: "1", method, params });
+
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname: url.hostname, port: url.port || 80, path: url.pathname, method: "POST",
+        headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) } },
+      (res) => {
+        let raw = "";
+        res.on("data", (chunk: string) => { raw += chunk; });
+        res.on("end", () => {
+          try {
+            const parsed = JSON.parse(raw) as { result?: unknown; error?: { message: string } };
+            if (parsed.error) reject(new Error(parsed.error.message));
+            else resolve(parsed.result);
+          } catch (e) { reject(e); }
+        });
+      },
+    );
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+async function flutterVmScreenshot(vmServiceUrl: string): Promise<{ dataUrl: string; width: number; height: number } | null> {
+  try {
+    const vm = await callFlutterVmService(vmServiceUrl, "getVM") as { isolates?: { id: string }[] };
+    const isolateId = vm.isolates?.[0]?.id;
+    if (!isolateId) return null;
+
+    const result = await callFlutterVmService(vmServiceUrl, "_flutter.screenshot", { isolateId }) as { screenshot?: string };
+    if (!result?.screenshot) return null;
+
+    const dataUrl = `data:image/png;base64,${result.screenshot}`;
+    const pngBuf = Buffer.from(result.screenshot, "base64");
+    // Read width/height from PNG header (bytes 16-23)
+    const width = pngBuf.length >= 24 ? pngBuf.readUInt32BE(16) : 0;
+    const height = pngBuf.length >= 24 ? pngBuf.readUInt32BE(20) : 0;
+    return { dataUrl, width, height };
+  } catch {
+    return null;
+  }
+}
+
+function escapeSendKeys(text: string): string {
+  return text.replace(/[+^%~(){}[\]]/g, (ch) => `{${ch}}`);
+}
+
+function keyNameToSendKeys(key: string): string {
+  const map: Record<string, string> = {
+    Enter: "{ENTER}", Return: "{ENTER}", Tab: "{TAB}", Backspace: "{BACKSPACE}",
+    Delete: "{DELETE}", Escape: "{ESC}", Esc: "{ESC}",
+    ArrowLeft: "{LEFT}", ArrowRight: "{RIGHT}", ArrowUp: "{UP}", ArrowDown: "{DOWN}",
+    Home: "{HOME}", End: "{END}", PageUp: "{PGUP}", PageDown: "{PGDN}",
+    F1: "{F1}", F2: "{F2}", F3: "{F3}", F4: "{F4}", F5: "{F5}", F6: "{F6}",
+    F7: "{F7}", F8: "{F8}", F9: "{F9}", F10: "{F10}", F11: "{F11}", F12: "{F12}",
+  };
+  return map[key] ?? `{${key.toUpperCase()}}`;
+}
+
+// ── Generic app window input helpers ────────────────────────────────────────
+
+function buildAppWindowFocusLines(processId?: number, titleQuery?: string): string[] {
+  if (processId !== undefined) {
+    return [
+      `$_proc = Get-Process -Id ${processId} -ErrorAction Stop`,
+      `$_hwnd = $_proc.MainWindowHandle`,
+    ];
+  }
+  if (titleQuery) {
+    return [
+      `$_proc = Get-Process | Where-Object { $_.MainWindowTitle -like ${toPowerShellLiteral(`*${titleQuery}*`)} } | Sort-Object WorkingSet64 -Descending | Select-Object -First 1`,
+      `if (-not $_proc) { throw ${toPowerShellLiteral(`No window found matching: ${titleQuery}`)} }`,
+      `$_hwnd = $_proc.MainWindowHandle`,
+    ];
+  }
+  throw new Error("Either processId or titleQuery must be provided to target an app window.");
+}
+
+async function runAppWindowScript(actionLines: string[], processId?: number, titleQuery?: string): Promise<void> {
+  const focusLines = buildAppWindowFocusLines(processId, titleQuery);
+  const script = [
+    `Add-Type -TypeDefinition ${toPowerShellLiteral(WIN_INPUT_TYPE_DEF)}`,
+    ...focusLines,
+    `$_rect = New-Object WI+RECT`,
+    `[WI]::GetWindowRect($_hwnd, [ref]$_rect) | Out-Null`,
+    `[WI]::SetForegroundWindow($_hwnd) | Out-Null`,
+    `Start-Sleep -Milliseconds 150`,
+    ...actionLines,
+  ].join("; ");
+  await runPowerShellVoid(script);
+}
+
+// ── end Generic app window input helpers ─────────────────────────────────────
+
+// ── end Flutter helpers ──────────────────────────────────────────────────────
 
 function buildResolveElementScript(selector: string, options?: { focus?: boolean; clear?: boolean }) {
   return `
@@ -1162,6 +1350,10 @@ async function readDirectoryTree(rootPath: string, depth = 0): Promise<Array<{
   );
 }
 
+const appIconPath = isDev
+  ? path.resolve(currentDir, "..", "..", "..", "..", "desktop", "renderer", "public", "images", "logo.ico")
+  : path.join(app.getAppPath(), "apps", "desktop", "renderer", "dist", "images", "logo.ico");
+
 async function createWindow(workspacePath = workspaceRoot) {
   const window = new BrowserWindow({
     width: 1480,
@@ -1171,6 +1363,7 @@ async function createWindow(workspacePath = workspaceRoot) {
     backgroundColor: "#111111",
     frame: false,
     titleBarStyle: "hidden",
+    icon: appIconPath,
     webPreferences: {
       preload: preloadPath,
       contextIsolation: true,
@@ -1292,6 +1485,13 @@ app.whenReady().then(async () => {
       await rmdir(resolvedPath);
       return { path: resolvedPath, deleted: true as const };
     },
+    moveFile: async (sourcePath: string, destPath: string) => {
+      const resolvedSource = resolveToolPath(sourcePath, rootPath);
+      const resolvedDest = resolveToolPath(destPath, rootPath);
+      await mkdir(path.dirname(resolvedDest), { recursive: true });
+      await rename(resolvedSource, resolvedDest);
+      return { from: resolvedSource, to: resolvedDest, moved: true as const };
+    },
     runCommand: async function* (command: string, cwd?: string) {
       const queue: CommandChunk[] = [];
       let pendingResolve: (() => void) | null = null;
@@ -1361,6 +1561,76 @@ app.whenReady().then(async () => {
     captureAppWindow: async (processId?: number, titleQuery?: string) => {
       return captureAppWindow(processId, titleQuery);
     },
+
+    clickAppWindow: async (x: number, y: number, processId?: number, titleQuery?: string) => {
+      if (process.platform !== "win32") throw new Error("click_app_window is only supported on Windows.");
+      await runAppWindowScript([
+        `[WI]::SetCursorPos($_rect.L + ${Math.round(x)}, $_rect.T + ${Math.round(y)}) | Out-Null`,
+        `Start-Sleep -Milliseconds 50`,
+        `[WI]::mouse_event(2, 0, 0, 0, [IntPtr]::Zero)`,
+        `Start-Sleep -Milliseconds 30`,
+        `[WI]::mouse_event(4, 0, 0, 0, [IntPtr]::Zero)`,
+      ], processId, titleQuery);
+      return { x, y, clicked: true as const };
+    },
+
+    scrollAppWindow: async (x: number, y: number, deltaY: number, processId?: number, titleQuery?: string) => {
+      if (process.platform !== "win32") throw new Error("scroll_app_window is only supported on Windows.");
+      const wheelData = Math.round(-deltaY) * 120;
+      const wheelDataUint = wheelData < 0 ? (0x100000000 + wheelData) : wheelData;
+      await runAppWindowScript([
+        `[WI]::SetCursorPos($_rect.L + ${Math.round(x)}, $_rect.T + ${Math.round(y)}) | Out-Null`,
+        `Start-Sleep -Milliseconds 50`,
+        `[WI]::mouse_event(0x800, 0, 0, [uint32]${wheelDataUint}, [IntPtr]::Zero)`,
+      ], processId, titleQuery);
+      return { scrolled: true as const };
+    },
+
+    typeAppWindow: async (text: string, processId?: number, titleQuery?: string) => {
+      if (process.platform !== "win32") throw new Error("type_app_window is only supported on Windows.");
+      const escaped = escapeSendKeys(text);
+      const focusLines = buildAppWindowFocusLines(processId, titleQuery);
+      const script = [
+        `Add-Type -TypeDefinition ${toPowerShellLiteral(WIN_INPUT_TYPE_DEF)}`,
+        ...focusLines,
+        `[WI]::SetForegroundWindow($_hwnd) | Out-Null`,
+        `Start-Sleep -Milliseconds 200`,
+        `Add-Type -AssemblyName System.Windows.Forms`,
+        `[System.Windows.Forms.SendKeys]::SendWait(${toPowerShellLiteral(escaped)})`,
+      ].join("; ");
+      await runPowerShellVoid(script);
+      return { text, typed: true as const };
+    },
+
+    pressAppWindowKey: async (key: string, processId?: number, titleQuery?: string) => {
+      if (process.platform !== "win32") throw new Error("press_app_window_key is only supported on Windows.");
+      const sendKey = keyNameToSendKeys(key);
+      const focusLines = buildAppWindowFocusLines(processId, titleQuery);
+      const script = [
+        `Add-Type -TypeDefinition ${toPowerShellLiteral(WIN_INPUT_TYPE_DEF)}`,
+        ...focusLines,
+        `[WI]::SetForegroundWindow($_hwnd) | Out-Null`,
+        `Start-Sleep -Milliseconds 150`,
+        `Add-Type -AssemblyName System.Windows.Forms`,
+        `[System.Windows.Forms.SendKeys]::SendWait(${toPowerShellLiteral(sendKey)})`,
+      ].join("; ");
+      await runPowerShellVoid(script);
+      return { key, pressed: true as const };
+    },
+
+    dragAppWindow: async (x: number, y: number, deltaX: number, deltaY: number, processId?: number, titleQuery?: string) => {
+      if (process.platform !== "win32") throw new Error("drag_app_window is only supported on Windows.");
+      await runAppWindowScript([
+        `[WI]::SetCursorPos($_rect.L + ${Math.round(x)}, $_rect.T + ${Math.round(y)}) | Out-Null`,
+        `Start-Sleep -Milliseconds 50`,
+        `[WI]::mouse_event(2, 0, 0, 0, [IntPtr]::Zero)`,
+        `Start-Sleep -Milliseconds 50`,
+        `[WI]::SetCursorPos($_rect.L + ${Math.round(x + deltaX)}, $_rect.T + ${Math.round(y + deltaY)}) | Out-Null`,
+        `Start-Sleep -Milliseconds 50`,
+        `[WI]::mouse_event(4, 0, 0, 0, [IntPtr]::Zero)`,
+      ], processId, titleQuery);
+      return { dragged: true as const };
+    },
     startCommandSession: async (command: string, cwd?: string) => {
       const resolvedCwd = cwd ? resolveToolPath(cwd, rootPath) : rootPath;
       const child = createShellChild(command, resolvedCwd);
@@ -1428,6 +1698,159 @@ app.whenReady().then(async () => {
         });
       });
     },
+
+    requestCommandReview: async (reviewId: string, _command: string, _cwd?: string) => {
+      return new Promise<{ approved: boolean }>((resolve) => {
+        pendingCommandReviewRequests.set(reviewId, {
+          senderId: sender.id,
+          resolve,
+        });
+      });
+    },
+
+    // ── Flutter handlers ──────────────────────────────────────────────────
+    flutterRun: async (projectPath: string, device?: string) => {
+      const resolvedPath = resolveToolPath(projectPath, rootPath);
+      return startFlutterRun(resolvedPath, device);
+    },
+
+    flutterHotReload: async (sessionId: string) => {
+      const session = activeFlutterSessions.get(sessionId);
+      if (!session) throw new Error(`Flutter session not found: ${sessionId}`);
+      session.process.stdin.write("r\n");
+      return { sessionId, reloaded: true as const };
+    },
+
+    flutterHotRestart: async (sessionId: string) => {
+      const session = activeFlutterSessions.get(sessionId);
+      if (!session) throw new Error(`Flutter session not found: ${sessionId}`);
+      session.process.stdin.write("R\n");
+      return { sessionId, restarted: true as const };
+    },
+
+    flutterStop: async (sessionId: string) => {
+      const session = activeFlutterSessions.get(sessionId);
+      if (!session) throw new Error(`Flutter session not found: ${sessionId}`);
+      session.process.stdin.write("q\n");
+      await delay(500);
+      if (!session.process.killed) {
+        session.process.kill(process.platform === "win32" ? "SIGKILL" : "SIGTERM");
+      }
+      activeFlutterSessions.delete(sessionId);
+      return { sessionId, stopped: true as const };
+    },
+
+    flutterScreenshot: async (sessionId: string) => {
+      const session = activeFlutterSessions.get(sessionId);
+      if (!session) throw new Error(`Flutter session not found: ${sessionId}`);
+
+      // Try VM service screenshot first (no window chrome)
+      if (session.vmServiceUrl) {
+        const vmShot = await flutterVmScreenshot(session.vmServiceUrl);
+        if (vmShot) {
+          return { mimeType: "image/png" as const, dataUrl: vmShot.dataUrl, width: vmShot.width, height: vmShot.height };
+        }
+      }
+
+      // Fall back to window capture
+      return captureAppWindow(session.pid ?? undefined, "flutter");
+    },
+
+    flutterTap: async (sessionId: string, x: number, y: number) => {
+      const session = activeFlutterSessions.get(sessionId);
+      if (!session) throw new Error(`Flutter session not found: ${sessionId}`);
+      if (!session.pid) throw new Error(`Flutter session has no PID: ${sessionId}`);
+      if (process.platform !== "win32") throw new Error("flutter_tap is only supported on Windows.");
+      await runAppWindowScript([
+        `[WI]::SetCursorPos($_rect.L + ${Math.round(x)}, $_rect.T + ${Math.round(y)}) | Out-Null`,
+        `Start-Sleep -Milliseconds 50`,
+        `[WI]::mouse_event(2, 0, 0, 0, [IntPtr]::Zero)`,
+        `Start-Sleep -Milliseconds 30`,
+        `[WI]::mouse_event(4, 0, 0, 0, [IntPtr]::Zero)`,
+      ], session.pid);
+      return { x, y, tapped: true as const };
+    },
+
+    flutterScroll: async (sessionId: string, x: number, y: number, deltaY: number) => {
+      const session = activeFlutterSessions.get(sessionId);
+      if (!session) throw new Error(`Flutter session not found: ${sessionId}`);
+      if (!session.pid) throw new Error(`Flutter session has no PID: ${sessionId}`);
+      if (process.platform !== "win32") throw new Error("flutter_scroll is only supported on Windows.");
+      const wheelData = Math.round(-deltaY) * 120;
+      const wheelDataUint = wheelData < 0 ? (0x100000000 + wheelData) : wheelData;
+      await runAppWindowScript([
+        `[WI]::SetCursorPos($_rect.L + ${Math.round(x)}, $_rect.T + ${Math.round(y)}) | Out-Null`,
+        `Start-Sleep -Milliseconds 50`,
+        `[WI]::mouse_event(0x800, 0, 0, [uint32]${wheelDataUint}, [IntPtr]::Zero)`,
+      ], session.pid);
+      return { scrolled: true as const };
+    },
+
+    flutterType: async (sessionId: string, text: string) => {
+      const session = activeFlutterSessions.get(sessionId);
+      if (!session) throw new Error(`Flutter session not found: ${sessionId}`);
+      if (!session.pid) throw new Error(`Flutter session has no PID: ${sessionId}`);
+      if (process.platform !== "win32") throw new Error("flutter_type is only supported on Windows.");
+      const focusLines = buildAppWindowFocusLines(session.pid);
+      const script = [
+        `Add-Type -TypeDefinition ${toPowerShellLiteral(WIN_INPUT_TYPE_DEF)}`,
+        ...focusLines,
+        `[WI]::SetForegroundWindow($_hwnd) | Out-Null`,
+        `Start-Sleep -Milliseconds 200`,
+        `Add-Type -AssemblyName System.Windows.Forms`,
+        `[System.Windows.Forms.SendKeys]::SendWait(${toPowerShellLiteral(escapeSendKeys(text))})`,
+      ].join("; ");
+      await runPowerShellVoid(script);
+      return { text, typed: true as const };
+    },
+
+    flutterPressKey: async (sessionId: string, key: string) => {
+      const session = activeFlutterSessions.get(sessionId);
+      if (!session) throw new Error(`Flutter session not found: ${sessionId}`);
+      if (!session.pid) throw new Error(`Flutter session has no PID: ${sessionId}`);
+      if (process.platform !== "win32") throw new Error("flutter_press_key is only supported on Windows.");
+      const focusLines = buildAppWindowFocusLines(session.pid);
+      const script = [
+        `Add-Type -TypeDefinition ${toPowerShellLiteral(WIN_INPUT_TYPE_DEF)}`,
+        ...focusLines,
+        `[WI]::SetForegroundWindow($_hwnd) | Out-Null`,
+        `Start-Sleep -Milliseconds 150`,
+        `Add-Type -AssemblyName System.Windows.Forms`,
+        `[System.Windows.Forms.SendKeys]::SendWait(${toPowerShellLiteral(keyNameToSendKeys(key))})`,
+      ].join("; ");
+      await runPowerShellVoid(script);
+      return { key, pressed: true as const };
+    },
+
+    flutterReadLog: async (sessionId: string) => {
+      const session = activeFlutterSessions.get(sessionId);
+      if (!session) throw new Error(`Flutter session not found: ${sessionId}`);
+      return {
+        sessionId,
+        log: session.log,
+        running: !session.process.killed,
+        vmServiceUrl: session.vmServiceUrl,
+      };
+    },
+
+    flutterGetWidgetTree: async (sessionId: string) => {
+      const session = activeFlutterSessions.get(sessionId);
+      if (!session) throw new Error(`Flutter session not found: ${sessionId}`);
+      if (!session.vmServiceUrl) throw new Error(`Flutter session has no VM service URL yet: ${sessionId}`);
+
+      const vm = await callFlutterVmService(session.vmServiceUrl, "getVM") as { isolates?: { id: string }[] };
+      const isolateId = vm.isolates?.[0]?.id;
+      if (!isolateId) throw new Error("No isolate found in Flutter VM.");
+
+      const tree = await callFlutterVmService(
+        session.vmServiceUrl,
+        "ext.flutter.inspector.getRootWidgetSummaryTree",
+        { isolateId, objectGroup: "tree" },
+      );
+      return { tree };
+    },
+    // ── end Flutter handlers ──────────────────────────────────────────────
+
     dispose: () => {
       browserSession.dispose();
     },
@@ -1483,6 +1906,12 @@ app.whenReady().then(async () => {
           pendingBrowserAssistRequests.delete(assistRequestId);
         }
       }
+      for (const [reviewId, pending] of pendingCommandReviewRequests) {
+        if (pending.senderId === event.sender.id) {
+          pending.resolve({ approved: false });
+          pendingCommandReviewRequests.delete(reviewId);
+        }
+      }
       agentToolHandlers.dispose();
       activeAgentRuns.delete(requestId);
       if (ollamaModel) {
@@ -1521,6 +1950,22 @@ app.whenReady().then(async () => {
     return { canceled: true as const };
   });
 
+  ipcMain.handle("agent:command-review-approve", async (_event, reviewId: string) => {
+    const pending = pendingCommandReviewRequests.get(reviewId);
+    if (!pending) return { approved: false as const };
+    pending.resolve({ approved: true });
+    pendingCommandReviewRequests.delete(reviewId);
+    return { approved: true as const };
+  });
+
+  ipcMain.handle("agent:command-review-cancel", async (_event, reviewId: string) => {
+    const pending = pendingCommandReviewRequests.get(reviewId);
+    if (!pending) return { canceled: false as const };
+    pending.resolve({ approved: false });
+    pendingCommandReviewRequests.delete(reviewId);
+    return { canceled: true as const };
+  });
+
   ipcMain.handle("agent:run-task", async (event, request: TaskRequest) => {
     const agentToolHandlers = createAgentToolHandlers(request.workspaceRoot || workspaceRoot, event.sender);
     const ollamaModel = request.modelProvider === "ollama" ? request.modelId?.trim() || "llama3:latest" : null;
@@ -1548,6 +1993,12 @@ app.whenReady().then(async () => {
         if (pending.senderId === event.sender.id) {
           pending.reject(new Error("Browser assistance was canceled."));
           pendingBrowserAssistRequests.delete(assistRequestId);
+        }
+      }
+      for (const [reviewId, pending] of pendingCommandReviewRequests) {
+        if (pending.senderId === event.sender.id) {
+          pending.resolve({ approved: false });
+          pendingCommandReviewRequests.delete(reviewId);
         }
       }
       agentToolHandlers.dispose();

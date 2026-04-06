@@ -24,6 +24,7 @@ type ToolHandlers = {
   createFile: (targetPath: string, content: string) => Promise<{ path: string; saved: true; originalContent: string }>;
   deleteFile: (targetPath: string) => Promise<{ path: string; deleted: true }>;
   deleteDirectory: (targetPath: string) => Promise<{ path: string; deleted: true }>;
+  moveFile: (sourcePath: string, destPath: string) => Promise<{ from: string; to: string; moved: true }>;
   runCommand: (
     command: string,
     cwd?: string,
@@ -72,6 +73,37 @@ type ToolHandlers = {
     width: number;
     height: number;
   }>;
+  clickAppWindow: (
+    x: number,
+    y: number,
+    processId?: number,
+    titleQuery?: string,
+  ) => Promise<{ x: number; y: number; clicked: true }>;
+  scrollAppWindow: (
+    x: number,
+    y: number,
+    deltaY: number,
+    processId?: number,
+    titleQuery?: string,
+  ) => Promise<{ scrolled: true }>;
+  typeAppWindow: (
+    text: string,
+    processId?: number,
+    titleQuery?: string,
+  ) => Promise<{ text: string; typed: true }>;
+  pressAppWindowKey: (
+    key: string,
+    processId?: number,
+    titleQuery?: string,
+  ) => Promise<{ key: string; pressed: true }>;
+  dragAppWindow: (
+    x: number,
+    y: number,
+    deltaX: number,
+    deltaY: number,
+    processId?: number,
+    titleQuery?: string,
+  ) => Promise<{ dragged: true }>;
   startCommandSession: (
     command: string,
     cwd?: string,
@@ -88,6 +120,36 @@ type ToolHandlers = {
     force?: boolean,
   ) => Promise<{ sessionId: string; stopped: true }>;
   requestBrowserAssist: (request: BrowserAssistRequest) => Promise<BrowserAssistResult>;
+  requestCommandReview: (reviewId: string, command: string, cwd?: string) => Promise<{ approved: boolean }>;
+  flutterRun: (
+    projectPath: string,
+    device?: string,
+  ) => Promise<{ sessionId: string; pid: number | null; vmServiceUrl: string | null }>;
+  flutterHotReload: (sessionId: string) => Promise<{ sessionId: string; reloaded: true }>;
+  flutterHotRestart: (sessionId: string) => Promise<{ sessionId: string; restarted: true }>;
+  flutterStop: (sessionId: string) => Promise<{ sessionId: string; stopped: true }>;
+  flutterScreenshot: (sessionId: string) => Promise<{
+    mimeType: "image/png";
+    dataUrl: string;
+    width: number;
+    height: number;
+  }>;
+  flutterTap: (sessionId: string, x: number, y: number) => Promise<{ x: number; y: number; tapped: true }>;
+  flutterScroll: (
+    sessionId: string,
+    x: number,
+    y: number,
+    deltaY: number,
+  ) => Promise<{ scrolled: true }>;
+  flutterType: (sessionId: string, text: string) => Promise<{ text: string; typed: true }>;
+  flutterPressKey: (sessionId: string, key: string) => Promise<{ key: string; pressed: true }>;
+  flutterReadLog: (sessionId: string) => Promise<{
+    sessionId: string;
+    log: string;
+    running: boolean;
+    vmServiceUrl: string | null;
+  }>;
+  flutterGetWidgetTree: (sessionId: string) => Promise<{ tree: unknown }>;
 };
 
 type GeminiPart =
@@ -292,6 +354,25 @@ const FILE_TOOLS = [
     },
   },
   {
+    name: "move_file",
+    description:
+      "Move or rename a file or directory. Works within the same filesystem. Use this instead of shell commands for any move or rename operation.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        source: {
+          type: "STRING",
+          description: "Absolute or workspace-relative path of the file or directory to move.",
+        },
+        destination: {
+          type: "STRING",
+          description: "Absolute or workspace-relative target path (including the new name if renaming).",
+        },
+      },
+      required: ["source", "destination"],
+    },
+  },
+  {
     name: "run_command",
     description:
       "Run a shell command in the workspace when inspection, build, search, or verification requires it. Stream output while it runs.",
@@ -473,6 +554,145 @@ const FILE_TOOLS = [
     },
   },
   {
+    name: "click_app_window",
+    description:
+      "Click at pixel coordinates inside a desktop application window. Use capture_app_window first to identify the target position. Provide processId when you launched the app, or titleQuery to find it by window title.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        x: {
+          type: "NUMBER",
+          description: "X coordinate in pixels from the left edge of the app window.",
+        },
+        y: {
+          type: "NUMBER",
+          description: "Y coordinate in pixels from the top edge of the app window.",
+        },
+        processId: {
+          type: "NUMBER",
+          description: "Process id of the target app. Preferred over titleQuery.",
+        },
+        titleQuery: {
+          type: "STRING",
+          description: "Partial window title to find the app window when processId is unavailable.",
+        },
+      },
+      required: ["x", "y"],
+    },
+  },
+  {
+    name: "scroll_app_window",
+    description:
+      "Scroll inside a desktop application window at a given position. Use capture_app_window first to identify the scroll target.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        x: {
+          type: "NUMBER",
+          description: "X coordinate of the scroll position in pixels from the left edge of the window.",
+        },
+        y: {
+          type: "NUMBER",
+          description: "Y coordinate of the scroll position in pixels from the top edge of the window.",
+        },
+        deltaY: {
+          type: "NUMBER",
+          description: "Vertical scroll amount in pixels. Positive scrolls down, negative scrolls up.",
+        },
+        processId: {
+          type: "NUMBER",
+          description: "Process id of the target app.",
+        },
+        titleQuery: {
+          type: "STRING",
+          description: "Partial window title to find the app window.",
+        },
+      },
+      required: ["x", "y", "deltaY"],
+    },
+  },
+  {
+    name: "type_app_window",
+    description:
+      "Type text into the currently focused element of a desktop application window. Click the target input field first with click_app_window.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        text: {
+          type: "STRING",
+          description: "Text to type into the focused element.",
+        },
+        processId: {
+          type: "NUMBER",
+          description: "Process id of the target app.",
+        },
+        titleQuery: {
+          type: "STRING",
+          description: "Partial window title to find the app window.",
+        },
+      },
+      required: ["text"],
+    },
+  },
+  {
+    name: "press_app_window_key",
+    description:
+      "Press a keyboard key in a desktop application window, such as Enter, Tab, Escape, or arrow keys.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        key: {
+          type: "STRING",
+          description: "Key name: Enter, Tab, Backspace, Delete, Escape, ArrowLeft, ArrowRight, ArrowUp, ArrowDown, Home, End, PageUp, PageDown, F1–F12.",
+        },
+        processId: {
+          type: "NUMBER",
+          description: "Process id of the target app.",
+        },
+        titleQuery: {
+          type: "STRING",
+          description: "Partial window title to find the app window.",
+        },
+      },
+      required: ["key"],
+    },
+  },
+  {
+    name: "drag_app_window",
+    description:
+      "Click and drag inside a desktop application window from a start position by a pixel offset. Useful for sliders, reordering, drawing, or resizing within an app.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        x: {
+          type: "NUMBER",
+          description: "X coordinate of the drag start position in pixels from the left edge of the window.",
+        },
+        y: {
+          type: "NUMBER",
+          description: "Y coordinate of the drag start position in pixels from the top edge of the window.",
+        },
+        deltaX: {
+          type: "NUMBER",
+          description: "Horizontal drag distance in pixels.",
+        },
+        deltaY: {
+          type: "NUMBER",
+          description: "Vertical drag distance in pixels.",
+        },
+        processId: {
+          type: "NUMBER",
+          description: "Process id of the target app.",
+        },
+        titleQuery: {
+          type: "STRING",
+          description: "Partial window title to find the app window.",
+        },
+      },
+      required: ["x", "y", "deltaX", "deltaY"],
+    },
+  },
+  {
     name: "start_command_session",
     description:
       "Start a long-running shell command session that stays alive, so you can inspect output, send more input later, or stop it explicitly.",
@@ -595,6 +815,231 @@ const FILE_TOOLS = [
         },
       },
       required: ["message"],
+    },
+  },
+  // ── Flutter tools ──────────────────────────────────────────────────────────
+  {
+    name: "flutter_create",
+    description:
+      "Create a new Flutter project with `flutter create`. Use this to scaffold a fresh app before running it.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        name: {
+          type: "STRING",
+          description: "Project name (snake_case, e.g. my_app).",
+        },
+        parentDir: {
+          type: "STRING",
+          description: "Absolute or workspace-relative directory to create the project inside. Omit to use the workspace root.",
+        },
+        org: {
+          type: "STRING",
+          description: "Reverse-domain organization identifier, e.g. com.example. Omit to use the Flutter default.",
+        },
+        template: {
+          type: "STRING",
+          description: "Project template: app (default), module, package, plugin.",
+        },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "flutter_run",
+    description:
+      "Start `flutter run` in debug mode for a Flutter project. Returns a sessionId you must pass to all other flutter_* tools. Waits until the app is compiled and the Dart VM service is ready (up to 90 s).",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        projectPath: {
+          type: "STRING",
+          description: "Absolute or workspace-relative path to the Flutter project root.",
+        },
+        device: {
+          type: "STRING",
+          description: "Target device id or name (e.g. windows, chrome, emulator-5554). Omit to let Flutter choose.",
+        },
+      },
+      required: ["projectPath"],
+    },
+  },
+  {
+    name: "flutter_screenshot",
+    description:
+      "Capture the current screen of a running Flutter app as a PNG for visual inspection.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        sessionId: {
+          type: "STRING",
+          description: "Active Flutter session id returned by flutter_run.",
+        },
+      },
+      required: ["sessionId"],
+    },
+  },
+  {
+    name: "flutter_tap",
+    description:
+      "Simulate a tap / left-click at pixel coordinates relative to the Flutter app window.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        sessionId: {
+          type: "STRING",
+          description: "Active Flutter session id.",
+        },
+        x: {
+          type: "NUMBER",
+          description: "X coordinate in pixels from the left edge of the app window.",
+        },
+        y: {
+          type: "NUMBER",
+          description: "Y coordinate in pixels from the top edge of the app window.",
+        },
+      },
+      required: ["sessionId", "x", "y"],
+    },
+  },
+  {
+    name: "flutter_scroll",
+    description:
+      "Simulate a scroll gesture in the Flutter app window at a given position.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        sessionId: {
+          type: "STRING",
+          description: "Active Flutter session id.",
+        },
+        x: {
+          type: "NUMBER",
+          description: "X coordinate of the scroll position in pixels from the left edge.",
+        },
+        y: {
+          type: "NUMBER",
+          description: "Y coordinate of the scroll position in pixels from the top edge.",
+        },
+        deltaY: {
+          type: "NUMBER",
+          description: "Vertical scroll amount. Positive scrolls down, negative scrolls up.",
+        },
+      },
+      required: ["sessionId", "x", "y", "deltaY"],
+    },
+  },
+  {
+    name: "flutter_type",
+    description:
+      "Type text into the currently focused widget in the Flutter app.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        sessionId: {
+          type: "STRING",
+          description: "Active Flutter session id.",
+        },
+        text: {
+          type: "STRING",
+          description: "Text to type.",
+        },
+      },
+      required: ["sessionId", "text"],
+    },
+  },
+  {
+    name: "flutter_press_key",
+    description:
+      "Press a keyboard key in the Flutter app, such as Enter, Tab, Backspace, or ArrowDown.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        sessionId: {
+          type: "STRING",
+          description: "Active Flutter session id.",
+        },
+        key: {
+          type: "STRING",
+          description: "Key name: Enter, Tab, Backspace, Delete, Escape, ArrowLeft, ArrowRight, ArrowUp, ArrowDown, Home, End, PageUp, PageDown, F1–F12.",
+        },
+      },
+      required: ["sessionId", "key"],
+    },
+  },
+  {
+    name: "flutter_hot_reload",
+    description:
+      "Trigger a hot reload in the running Flutter app (equivalent to pressing r in the terminal).",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        sessionId: {
+          type: "STRING",
+          description: "Active Flutter session id.",
+        },
+      },
+      required: ["sessionId"],
+    },
+  },
+  {
+    name: "flutter_hot_restart",
+    description:
+      "Trigger a full hot restart in the running Flutter app (equivalent to pressing R in the terminal). State is reset.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        sessionId: {
+          type: "STRING",
+          description: "Active Flutter session id.",
+        },
+      },
+      required: ["sessionId"],
+    },
+  },
+  {
+    name: "flutter_read_log",
+    description:
+      "Read the accumulated stdout / stderr log of the running Flutter process to check for errors, print output, or VM service URL.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        sessionId: {
+          type: "STRING",
+          description: "Active Flutter session id.",
+        },
+      },
+      required: ["sessionId"],
+    },
+  },
+  {
+    name: "flutter_get_widget_tree",
+    description:
+      "Fetch the widget tree from the Flutter Inspector via the Dart VM service for structural UI inspection.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        sessionId: {
+          type: "STRING",
+          description: "Active Flutter session id.",
+        },
+      },
+      required: ["sessionId"],
+    },
+  },
+  {
+    name: "flutter_stop",
+    description:
+      "Stop a running Flutter debug session gracefully.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        sessionId: {
+          type: "STRING",
+          description: "Active Flutter session id to stop.",
+        },
+      },
+      required: ["sessionId"],
     },
   },
 ];
@@ -954,7 +1399,7 @@ function buildSystemInstruction(request: TaskRequest, decision: ModeDecision, re
     "When you need file contents, directory structure, or to save a change, call the provided tools yourself instead of asking for permission.",
     "Use run_command only for shell-native tasks such as build, test, search, git, package-manager, or environment inspection.",
     "Do not use run_command for normal file editing, file creation, file deletion, or empty-folder deletion when a dedicated file tool exists.",
-    "Prefer read_file, list_dir, write_file, create_file, delete_file, and delete_directory over shell commands whenever they can accomplish the task.",
+    "Prefer read_file, list_dir, write_file, create_file, delete_file, delete_directory, and move_file over shell commands whenever they can accomplish the task.",
     "Do not use run_command to read files, print file contents, cat/type files, or inspect local documents when read_file or a dedicated document tool can do it directly.",
     "For local desktop programs, game engines, simulators, or other non-browser apps, use capture_app_window to inspect the actual rendered screen when visual confirmation matters.",
     "If you launch a local app and need to verify what is visible on screen, do not guess from logs alone. Capture the real window when possible.",
@@ -998,7 +1443,7 @@ function buildSystemInstruction(request: TaskRequest, decision: ModeDecision, re
     "Empty folders may be removed with delete_directory. Do not use it on non-empty folders.",
     "You may chat casually between edits. Natural conversation is allowed even in the middle of code work.",
     "Use tools in multiple steps when needed: inspect, reason, edit, verify mentally, then respond.",
-    "When making a real code change, use write_file, create_file, delete_file, or delete_directory instead of shelling out or pasting code into the chat.",
+    "When making a real code change, use write_file, create_file, delete_file, delete_directory, or move_file instead of shelling out or pasting code into the chat.",
     "Do not paste large code blocks or full files in your conversational reply unless the user explicitly asks to see the code.",
     "After tool work, explain clearly what you changed or what you found in plain language.",
     "You must decide when the turn is actually complete. Do not rely on the runtime to assume completion from silence.",
@@ -1699,6 +2144,22 @@ async function* executeToolCall(
     };
   }
 
+  if (call.name === "move_file") {
+    const sourceArg = typeof call.args.source === "string" ? call.args.source : "";
+    const destArg = typeof call.args.destination === "string" ? call.args.destination : "";
+    yield { type: "status", label: `Moving ${sourceArg} → ${destArg}` };
+    const result = await handlers.moveFile(sourceArg, destArg);
+    yield { type: "file-move", fromPath: result.from, toPath: result.to };
+    return {
+      functionResponse: {
+        name: call.name,
+        response: {
+          result,
+        },
+      },
+    };
+  }
+
   if (call.name === "run_command") {
     const commandArg = typeof call.args.command === "string" ? call.args.command : "";
     const cwdArg = typeof call.args.cwd === "string" ? call.args.cwd : undefined;
@@ -1708,10 +2169,23 @@ async function* executeToolCall(
           name: call.name,
           response: {
             error:
-              "run_command cannot be used for file or folder creation, editing, moving, renaming, copying, or deletion. Use create_file, write_file, delete_file, or delete_directory instead.",
+              "run_command cannot be used for file or folder creation, editing, moving, renaming, copying, or deletion. Use create_file, write_file, delete_file, delete_directory, or move_file instead.",
           },
         },
       };
+    }
+    {
+      const reviewId = `review-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      yield { type: "command-review-request", reviewId, command: commandArg, cwd: cwdArg };
+      const review = await handlers.requestCommandReview(reviewId, commandArg, cwdArg);
+      if (!review.approved) {
+        return {
+          functionResponse: {
+            name: call.name,
+            response: { error: "Command was rejected by the user during review." },
+          },
+        };
+      }
     }
     const commandId = `command-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     yield { type: "command-start", commandId, command: commandArg };
@@ -1894,9 +2368,73 @@ async function* executeToolCall(
     };
   }
 
+  if (call.name === "click_app_window") {
+    const xArg = typeof call.args.x === "number" ? call.args.x : 0;
+    const yArg = typeof call.args.y === "number" ? call.args.y : 0;
+    const processIdArg = typeof call.args.processId === "number" ? call.args.processId : undefined;
+    const titleQueryArg = typeof call.args.titleQuery === "string" ? call.args.titleQuery : undefined;
+    yield { type: "status", label: `Clicking app window at (${xArg}, ${yArg})` };
+    const result = await handlers.clickAppWindow(xArg, yArg, processIdArg, titleQueryArg);
+    return { functionResponse: { name: call.name, response: { result } } };
+  }
+
+  if (call.name === "scroll_app_window") {
+    const xArg = typeof call.args.x === "number" ? call.args.x : 0;
+    const yArg = typeof call.args.y === "number" ? call.args.y : 0;
+    const deltaYArg = typeof call.args.deltaY === "number" ? call.args.deltaY : 0;
+    const processIdArg = typeof call.args.processId === "number" ? call.args.processId : undefined;
+    const titleQueryArg = typeof call.args.titleQuery === "string" ? call.args.titleQuery : undefined;
+    yield { type: "status", label: `Scrolling app window by ${deltaYArg}px` };
+    const result = await handlers.scrollAppWindow(xArg, yArg, deltaYArg, processIdArg, titleQueryArg);
+    return { functionResponse: { name: call.name, response: { result } } };
+  }
+
+  if (call.name === "type_app_window") {
+    const textArg = typeof call.args.text === "string" ? call.args.text : "";
+    const processIdArg = typeof call.args.processId === "number" ? call.args.processId : undefined;
+    const titleQueryArg = typeof call.args.titleQuery === "string" ? call.args.titleQuery : undefined;
+    yield { type: "status", label: "Typing into app window" };
+    const result = await handlers.typeAppWindow(textArg, processIdArg, titleQueryArg);
+    return { functionResponse: { name: call.name, response: { result } } };
+  }
+
+  if (call.name === "press_app_window_key") {
+    const keyArg = typeof call.args.key === "string" ? call.args.key : "";
+    const processIdArg = typeof call.args.processId === "number" ? call.args.processId : undefined;
+    const titleQueryArg = typeof call.args.titleQuery === "string" ? call.args.titleQuery : undefined;
+    yield { type: "status", label: `Pressing ${keyArg} in app window` };
+    const result = await handlers.pressAppWindowKey(keyArg, processIdArg, titleQueryArg);
+    return { functionResponse: { name: call.name, response: { result } } };
+  }
+
+  if (call.name === "drag_app_window") {
+    const xArg = typeof call.args.x === "number" ? call.args.x : 0;
+    const yArg = typeof call.args.y === "number" ? call.args.y : 0;
+    const deltaXArg = typeof call.args.deltaX === "number" ? call.args.deltaX : 0;
+    const deltaYArg = typeof call.args.deltaY === "number" ? call.args.deltaY : 0;
+    const processIdArg = typeof call.args.processId === "number" ? call.args.processId : undefined;
+    const titleQueryArg = typeof call.args.titleQuery === "string" ? call.args.titleQuery : undefined;
+    yield { type: "status", label: `Dragging in app window` };
+    const result = await handlers.dragAppWindow(xArg, yArg, deltaXArg, deltaYArg, processIdArg, titleQueryArg);
+    return { functionResponse: { name: call.name, response: { result } } };
+  }
+
   if (call.name === "start_command_session") {
     const commandArg = typeof call.args.command === "string" ? call.args.command : "";
     const cwdArg = typeof call.args.cwd === "string" ? call.args.cwd : undefined;
+    {
+      const reviewId = `review-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      yield { type: "command-review-request", reviewId, command: commandArg, cwd: cwdArg };
+      const review = await handlers.requestCommandReview(reviewId, commandArg, cwdArg);
+      if (!review.approved) {
+        return {
+          functionResponse: {
+            name: call.name,
+            response: { error: "Command was rejected by the user during review." },
+          },
+        };
+      }
+    }
     yield { type: "status", label: `Starting command session ${commandArg}` };
     const result = await handlers.startCommandSession(commandArg, cwdArg);
     return {
@@ -1983,6 +2521,128 @@ async function* executeToolCall(
         },
       },
     };
+  }
+
+  // ── Flutter tools ────────────────────────────────────────────────────────
+
+  if (call.name === "flutter_create") {
+    const nameArg = typeof call.args.name === "string" ? call.args.name : "";
+    const parentDirArg = typeof call.args.parentDir === "string" ? call.args.parentDir : undefined;
+    const orgArg = typeof call.args.org === "string" ? call.args.org : undefined;
+    const templateArg = typeof call.args.template === "string" ? call.args.template : undefined;
+    const orgFlag = orgArg ? ` --org ${orgArg}` : "";
+    const templateFlag = templateArg ? ` --template ${templateArg}` : "";
+    const command = `flutter create${orgFlag}${templateFlag} ${nameArg}`;
+    const commandId = `command-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    yield { type: "status", label: `Creating Flutter project ${nameArg}` };
+    yield { type: "command-start", commandId, command };
+    const iterator = handlers.runCommand(command, parentDirArg)[Symbol.asyncIterator]();
+    let exitCode: number | null = null;
+    while (true) {
+      const next = await iterator.next();
+      if (next.done) { exitCode = next.value ?? null; break; }
+      yield { type: "command", commandId, chunk: next.value };
+    }
+    yield { type: "command-end", commandId, exitCode };
+    if (exitCode !== 0) {
+      return { functionResponse: { name: call.name, response: { error: `flutter create failed with exit code ${exitCode}` } } };
+    }
+    return {
+      functionResponse: {
+        name: call.name,
+        response: { result: { name: nameArg, path: parentDirArg ? `${parentDirArg}/${nameArg}` : nameArg, created: true } },
+      },
+    };
+  }
+
+  if (call.name === "flutter_run") {
+    const projectPathArg = typeof call.args.projectPath === "string" ? call.args.projectPath : "";
+    const deviceArg = typeof call.args.device === "string" ? call.args.device : undefined;
+    yield { type: "status", label: `Starting Flutter${deviceArg ? ` on ${deviceArg}` : ""}` };
+    const result = await handlers.flutterRun(projectPathArg, deviceArg);
+    return {
+      functionResponse: {
+        name: call.name,
+        response: { result: { ...result, projectPath: projectPathArg } },
+      },
+    };
+  }
+
+  if (call.name === "flutter_screenshot") {
+    const sessionIdArg = typeof call.args.sessionId === "string" ? call.args.sessionId : "";
+    yield { type: "status", label: "Capturing Flutter screenshot" };
+    const result = await handlers.flutterScreenshot(sessionIdArg);
+    return { functionResponse: { name: call.name, response: { result } } };
+  }
+
+  if (call.name === "flutter_tap") {
+    const sessionIdArg = typeof call.args.sessionId === "string" ? call.args.sessionId : "";
+    const xArg = typeof call.args.x === "number" ? call.args.x : 0;
+    const yArg = typeof call.args.y === "number" ? call.args.y : 0;
+    yield { type: "status", label: `Tapping Flutter at (${xArg}, ${yArg})` };
+    const result = await handlers.flutterTap(sessionIdArg, xArg, yArg);
+    return { functionResponse: { name: call.name, response: { result } } };
+  }
+
+  if (call.name === "flutter_scroll") {
+    const sessionIdArg = typeof call.args.sessionId === "string" ? call.args.sessionId : "";
+    const xArg = typeof call.args.x === "number" ? call.args.x : 0;
+    const yArg = typeof call.args.y === "number" ? call.args.y : 0;
+    const deltaYArg = typeof call.args.deltaY === "number" ? call.args.deltaY : 0;
+    yield { type: "status", label: `Scrolling Flutter by ${deltaYArg}px` };
+    const result = await handlers.flutterScroll(sessionIdArg, xArg, yArg, deltaYArg);
+    return { functionResponse: { name: call.name, response: { result } } };
+  }
+
+  if (call.name === "flutter_type") {
+    const sessionIdArg = typeof call.args.sessionId === "string" ? call.args.sessionId : "";
+    const textArg = typeof call.args.text === "string" ? call.args.text : "";
+    yield { type: "status", label: `Typing into Flutter app` };
+    const result = await handlers.flutterType(sessionIdArg, textArg);
+    return { functionResponse: { name: call.name, response: { result } } };
+  }
+
+  if (call.name === "flutter_press_key") {
+    const sessionIdArg = typeof call.args.sessionId === "string" ? call.args.sessionId : "";
+    const keyArg = typeof call.args.key === "string" ? call.args.key : "";
+    yield { type: "status", label: `Pressing ${keyArg} in Flutter app` };
+    const result = await handlers.flutterPressKey(sessionIdArg, keyArg);
+    return { functionResponse: { name: call.name, response: { result } } };
+  }
+
+  if (call.name === "flutter_hot_reload") {
+    const sessionIdArg = typeof call.args.sessionId === "string" ? call.args.sessionId : "";
+    yield { type: "status", label: "Flutter hot reload" };
+    const result = await handlers.flutterHotReload(sessionIdArg);
+    return { functionResponse: { name: call.name, response: { result } } };
+  }
+
+  if (call.name === "flutter_hot_restart") {
+    const sessionIdArg = typeof call.args.sessionId === "string" ? call.args.sessionId : "";
+    yield { type: "status", label: "Flutter hot restart" };
+    const result = await handlers.flutterHotRestart(sessionIdArg);
+    return { functionResponse: { name: call.name, response: { result } } };
+  }
+
+  if (call.name === "flutter_read_log") {
+    const sessionIdArg = typeof call.args.sessionId === "string" ? call.args.sessionId : "";
+    yield { type: "status", label: "Reading Flutter log" };
+    const result = await handlers.flutterReadLog(sessionIdArg);
+    return { functionResponse: { name: call.name, response: { result } } };
+  }
+
+  if (call.name === "flutter_get_widget_tree") {
+    const sessionIdArg = typeof call.args.sessionId === "string" ? call.args.sessionId : "";
+    yield { type: "status", label: "Fetching Flutter widget tree" };
+    const result = await handlers.flutterGetWidgetTree(sessionIdArg);
+    return { functionResponse: { name: call.name, response: { result } } };
+  }
+
+  if (call.name === "flutter_stop") {
+    const sessionIdArg = typeof call.args.sessionId === "string" ? call.args.sessionId : "";
+    yield { type: "status", label: "Stopping Flutter session" };
+    const result = await handlers.flutterStop(sessionIdArg);
+    return { functionResponse: { name: call.name, response: { result } } };
   }
 
   return {

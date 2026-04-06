@@ -30,6 +30,8 @@ contextBridge.exposeInMainWorld("cogent", {
   cancelAgentTaskStream: async (requestId) => ipcRenderer.invoke("agent:cancel-run-task-stream", requestId),
   completeBrowserAssist: async (payload) => ipcRenderer.invoke("agent:browser-assist-complete", payload),
   cancelBrowserAssist: async (requestId) => ipcRenderer.invoke("agent:browser-assist-cancel", requestId),
+  approveCommandReview: async (reviewId) => ipcRenderer.invoke("agent:command-review-approve", reviewId),
+  cancelCommandReview: async (reviewId) => ipcRenderer.invoke("agent:command-review-cancel", reviewId),
   buildContextSnapshot: async (request) => ipcRenderer.invoke("agent:context", request),
   buildContextUsageSnapshot: async (request) => ipcRenderer.invoke("agent:context-usage", request),
   runCommand: async (request) => ipcRenderer.invoke("command:run", request),

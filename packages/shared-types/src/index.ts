@@ -133,7 +133,9 @@ export type AgentStreamEvent =
   | { type: "file-write-start"; path: string }
   | { type: "file-write"; path: string; content: string; originalContent: string }
   | { type: "file-delete"; path: string }
+  | { type: "file-move"; fromPath: string; toPath: string }
   | { type: "directory-delete"; path: string }
+  | { type: "command-review-request"; reviewId: string; command: string; cwd?: string }
   | { type: "command-start"; commandId: string; command: string }
   | { type: "command"; commandId: string; chunk: CommandChunk }
   | { type: "command-end"; commandId: string; exitCode: number | null }

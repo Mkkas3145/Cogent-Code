@@ -147,6 +147,18 @@ function hasRenderableMessageContent(message: ChatMessage) {
   );
 }
 
+function isEphemeralAssistantPlaceholder(message: ChatMessage) {
+  return (
+    message.role === "assistant" &&
+    !message.text.trim() &&
+    !message.meta?.length &&
+    message.code === undefined &&
+    !message.command &&
+    !message.attachments?.length &&
+    !message.fileAttachments?.length
+  );
+}
+
 function buildRenderItems(messages: ChatMessage[]) {
   const items: RenderItem[] = [];
 
@@ -1106,6 +1118,7 @@ const OLLAMA_CONTEXT_LENGTH_STORAGE_KEY = "cogent.ollamaContextLength";
 const LMSTUDIO_MODEL_STORAGE_KEY = "cogent.lmstudioModel";
 const LMSTUDIO_CONTEXT_LENGTH_STORAGE_KEY = "cogent.lmstudioContextLength";
 const AUTO_COLLAPSE_TOOL_GROUPS_STORAGE_KEY = "cogent.autoCollapseToolGroups";
+const COMMAND_REVIEW_MODE_STORAGE_KEY = "cogent.commandReviewMode";
 const CHAT_SESSIONS_STORAGE_KEY = "cogent.chatSessions";
 const ACTIVE_SESSION_STORAGE_KEY = "cogent.activeSessionId";
 const GLOBAL_SYSTEM_PROMPT_STORAGE_KEY = "cogent.globalSystemPrompt";
@@ -1181,6 +1194,10 @@ const COPY = {
     settingsLmStudioContextLengthLabel: "LM Studio context length",
     settingsLmStudioContextLengthDescription: "Lower this to reduce memory usage. Example: 8192",
     settingsAutomaticPlaceholder: "Calculates the maximum by considering available system headroom.",
+    settingsCommandReviewLabel: "Command review mode",
+    settingsCommandReviewDescription: "Show a confirmation dialog before running any shell command.",
+    commandReviewTitle: "Run this command?",
+    commandReviewApprove: "Run",
     settingsAutoCollapseLabel: "Auto-collapse tool cards",
     settingsAutoCollapseDescription: "Collapse diff and command groups automatically when they appear.",
     settingsGlobalSystemPromptLabel: "Global system prompt",
@@ -1219,6 +1236,7 @@ const COPY = {
     fileReadRange: (fileName: string, startLine: number, endLine: number) =>
       `Cogent read ${fileName} from line ${startLine} to line ${endLine}.`,
     fileDelete: (fileName: string) => `Cogent deleted ${fileName}.`,
+    fileMove: (fromName: string, toName: string) => `Cogent moved ${fromName} → ${toName}.`,
     directoryDelete: (directoryName: string) => `Cogent deleted the ${directoryName} folder.`,
     statusRequesting: "Requesting",
     statusLoading: "Loading",
@@ -1290,6 +1308,10 @@ const COPY = {
     settingsLmStudioContextLengthLabel: "LM Studio 컨텍스트 길이",
     settingsLmStudioContextLengthDescription: "메모리를 줄이려면 이 값을 낮추세요. 예: 8192",
     settingsAutomaticPlaceholder: "시스템의 여유분을 고려하여 최대값을 계산합니다.",
+    settingsCommandReviewLabel: "명령어 검토 모드",
+    settingsCommandReviewDescription: "쉘 명령어를 실행하기 전에 확인 창을 표시합니다.",
+    commandReviewTitle: "이 명령어를 실행할까요?",
+    commandReviewApprove: "실행",
     settingsAutoCollapseLabel: "도구 카드 자동 접기",
     settingsAutoCollapseDescription: "diff와 명령어 그룹이 생길 때 자동으로 접습니다.",
     settingsGlobalSystemPromptLabel: "전역 시스템 프롬프트",
@@ -1328,6 +1350,7 @@ const COPY = {
     fileReadRange: (fileName: string, startLine: number, endLine: number) =>
       `Cogent 에이전트가 ${fileName} 파일을 ${startLine}번 줄에서 ${endLine}번 줄까지 읽었습니다.`,
     fileDelete: (fileName: string) => `Cogent 에이전트가 ${fileName} 파일을 삭제했습니다.`,
+    fileMove: (fromName: string, toName: string) => `Cogent 에이전트가 ${fromName}을(를) ${toName}으로 이동했습니다.`,
     directoryDelete: (directoryName: string) => `Cogent 에이전트가 ${directoryName} 폴더를 삭제했습니다.`,
     statusRequesting: "요청 중",
     statusLoading: "로드 중",
@@ -1399,6 +1422,10 @@ const COPY = {
     settingsLmStudioContextLengthLabel: "LM Studio コンテキスト長",
     settingsLmStudioContextLengthDescription: "メモリ使用量を減らすにはこの値を下げます。例: 8192",
     settingsAutomaticPlaceholder: "システムの余裕分を考慮して最大値を計算します。",
+    settingsCommandReviewLabel: "コマンドレビューモード",
+    settingsCommandReviewDescription: "シェルコマンドを実行する前に確認ダイアログを表示します。",
+    commandReviewTitle: "このコマンドを実行しますか?",
+    commandReviewApprove: "実行",
     settingsAutoCollapseLabel: "ツ?ルカ?ドを自動で折りたたむ",
     settingsAutoCollapseDescription: "diff とコマンドのグル?プを生成時に自動で折りたたみます。",
     settingsGlobalSystemPromptLabel: "グロ?バルシステムプロンプト",
@@ -1437,6 +1464,7 @@ const COPY = {
     fileReadRange: (fileName: string, startLine: number, endLine: number) =>
       `Cogent が ${fileName} を ${startLine} 行目から ${endLine} 行目まで?みました。`,
     fileDelete: (fileName: string) => `Cogent が ${fileName} を削除しました。`,
+    fileMove: (fromName: string, toName: string) => `Cogent が ${fromName} を ${toName} に移動しました。`,
     directoryDelete: (directoryName: string) => `Cogent が ${directoryName} フォルダを削除しました。`,
     statusRequesting: "リクエスト中",
     statusLoading: "ロ?ド中",
@@ -1507,6 +1535,8 @@ declare global {
       cancelAgentTaskStream: (requestId: string) => Promise<{ canceled: boolean }>;
       completeBrowserAssist: (payload: BrowserAssistResult) => Promise<{ completed: boolean }>;
       cancelBrowserAssist: (requestId: string) => Promise<{ canceled: boolean }>;
+      approveCommandReview: (reviewId: string) => Promise<{ approved: boolean }>;
+      cancelCommandReview: (reviewId: string) => Promise<{ canceled: boolean }>;
       buildContextSnapshot: (request: {
         prompt: string;
         ollamaContextLength?: number;
@@ -1715,6 +1745,10 @@ export function App() {
   const [isModelSelectionWarningVisible, setIsModelSelectionWarningVisible] = useState(false);
   const [autoCollapseToolGroups, setAutoCollapseToolGroups] = useState(true);
   const [autoCollapseToolGroupsDraft, setAutoCollapseToolGroupsDraft] = useState(true);
+  const [commandReviewMode, setCommandReviewMode] = useState(true);
+  const [commandReviewModeDraft, setCommandReviewModeDraft] = useState(true);
+  const [pendingCommandReview, setPendingCommandReview] = useState<{ reviewId: string; command: string; cwd?: string } | null>(null);
+  const [isCommandReviewVisible, setIsCommandReviewVisible] = useState(false);
   const [globalSystemPrompt, setGlobalSystemPrompt] = useState("");
   const [globalSystemPromptDraft, setGlobalSystemPromptDraft] = useState("");
   const [lmStudioContextLength, setLmStudioContextLength] = useState("");
@@ -2347,20 +2381,23 @@ export function App() {
           updateSessionById(currentSessionId, (session) => ({
             ...session,
             messages: [
-              ...session.messages,
-              {
-                id: `${Date.now()}-command-${event.commandId}`,
-                role: "assistant",
-                text: "",
-                textChunks: [],
-                command: {
-                  id: event.commandId,
-                  command: event.command,
-                  output: "",
-                  running: true,
-                  startedAt: Date.now(),
-                },
-              },
+              ...session.messages.map((message) =>
+                message.id === activeTextMessageId && isEphemeralAssistantPlaceholder(message)
+                  ? {
+                      ...message,
+                      id: `${Date.now()}-command-${event.commandId}`,
+                      status: undefined,
+                      activityStatusLabel: undefined,
+                      command: {
+                        id: event.commandId,
+                        command: event.command,
+                        output: "",
+                        running: true,
+                        startedAt: Date.now(),
+                      },
+                    }
+                  : message,
+              ),
               {
                 id: nextAssistantId,
                 role: "assistant",
@@ -2407,6 +2444,23 @@ export function App() {
                 : message,
             ),
           }));
+          return;
+        }
+
+        if (event.type === "command-review-request") {
+          if (autoCollapseToolGroups) {
+            const toolGroupToCollapse = findLatestToolGroupId(
+              sessions.find((s) => s.id === currentSessionId)?.messages ?? [],
+            );
+            if (toolGroupToCollapse) {
+              setCollapsedToolGroups((current) => ({ ...current, [toolGroupToCollapse]: true }));
+            }
+          }
+          if (commandReviewMode) {
+            setPendingCommandReview({ reviewId: event.reviewId, command: event.command, cwd: event.cwd });
+          } else {
+            void getCogent()?.approveCommandReview(event.reviewId);
+          }
           return;
         }
 
@@ -2582,7 +2636,7 @@ export function App() {
           return;
         }
 
-        if (event.type === "file-delete" || event.type === "directory-delete") {
+        if (event.type === "file-delete" || event.type === "directory-delete" || event.type === "file-move") {
           if (event.type === "file-delete" && selectedFile?.path === event.path) {
             setIsEditorOpen(false);
             setShouldAutoOpenEditor(false);
@@ -2591,24 +2645,28 @@ export function App() {
             setSaveState("idle");
           }
 
-          if (event.type === "file-delete" || event.type === "directory-delete") {
-            const metaLine =
-              event.type === "directory-delete"
-                ? text.directoryDelete(getFileName(event.path))
-                : text.fileDelete(getFileName(event.path));
-            updateSessionById(currentSessionId, (session) => ({
-              ...session,
-              messages: session.messages.map((message) =>
-                message.id === activeTextMessageId
-                  ? {
-                      ...message,
-                      status: "thinking",
-                      meta: metaLine ? [...(message.meta ?? []), metaLine] : message.meta,
-                    }
-                  : message,
-              ),
-            }));
+          if (event.type === "file-move" && selectedFile?.path === event.fromPath) {
+            setSelectedFile((current) => (current ? { ...current, path: event.toPath } : current));
           }
+
+          const metaLine =
+            event.type === "directory-delete"
+              ? text.directoryDelete(getFileName(event.path))
+              : event.type === "file-move"
+                ? text.fileMove(getFileName(event.fromPath), getFileName(event.toPath))
+                : text.fileDelete(getFileName(event.path));
+          updateSessionById(currentSessionId, (session) => ({
+            ...session,
+            messages: session.messages.map((message) =>
+              message.id === activeTextMessageId
+                ? {
+                    ...message,
+                    status: "thinking",
+                    meta: metaLine ? [...(message.meta ?? []), metaLine] : message.meta,
+                  }
+                : message,
+            ),
+          }));
 
           void cogent.getFileTree().then((tree) => {
             setFileTree(tree.children ?? []);
@@ -3091,8 +3149,10 @@ export function App() {
     const savedLmStudioModel = window.localStorage.getItem(LMSTUDIO_MODEL_STORAGE_KEY) ?? "";
     const savedLmStudioContextLength = window.localStorage.getItem(LMSTUDIO_CONTEXT_LENGTH_STORAGE_KEY);
     const rawAutoCollapseToolGroups = window.localStorage.getItem(AUTO_COLLAPSE_TOOL_GROUPS_STORAGE_KEY);
+    const rawCommandReviewMode = window.localStorage.getItem(COMMAND_REVIEW_MODE_STORAGE_KEY);
     const savedGlobalSystemPrompt = window.localStorage.getItem(GLOBAL_SYSTEM_PROMPT_STORAGE_KEY) ?? "";
     const savedAutoCollapseToolGroups = rawAutoCollapseToolGroups === null ? true : rawAutoCollapseToolGroups === "true";
+    const savedCommandReviewMode = rawCommandReviewMode === null ? true : rawCommandReviewMode === "true";
     setGeminiApiKey(savedKey);
     setGeminiApiKeyDraft(savedKey);
     setGlobalSystemPrompt(savedGlobalSystemPrompt);
@@ -3103,6 +3163,8 @@ export function App() {
     setLmStudioContextLengthDraft(savedLmStudioContextLength ?? "");
     setAutoCollapseToolGroups(savedAutoCollapseToolGroups);
     setAutoCollapseToolGroupsDraft(savedAutoCollapseToolGroups);
+    setCommandReviewMode(savedCommandReviewMode);
+    setCommandReviewModeDraft(savedCommandReviewMode);
     if (savedProvider === "gemini" || savedProvider === "ollama" || savedProvider === "lmstudio") {
       setModelProvider(savedProvider);
     }
@@ -3375,6 +3437,21 @@ export function App() {
 
     window.localStorage.setItem(AUTO_COLLAPSE_TOOL_GROUPS_STORAGE_KEY, String(autoCollapseToolGroups));
   }, [autoCollapseToolGroups]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(COMMAND_REVIEW_MODE_STORAGE_KEY, String(commandReviewMode));
+  }, [commandReviewMode]);
+
+  useEffect(() => {
+    if (pendingCommandReview) {
+      setIsCommandReviewVisible(false);
+      const frame = window.requestAnimationFrame(() => setIsCommandReviewVisible(true));
+      return () => window.cancelAnimationFrame(frame);
+    }
+    setIsCommandReviewVisible(false);
+    return undefined;
+  }, [pendingCommandReview]);
 
   useEffect(() => {
     if (!activeSession?.id) {
@@ -3710,20 +3787,23 @@ export function App() {
           updateSessionById(currentSessionId, (session) => ({
             ...session,
             messages: [
-              ...session.messages,
-              {
-                id: `${Date.now()}-command-${event.commandId}`,
-                role: "assistant",
-                text: "",
-                textChunks: [],
-                command: {
-                  id: event.commandId,
-                  command: event.command,
-                  output: "",
-                  running: true,
-                  startedAt: Date.now(),
-                },
-              },
+              ...session.messages.map((message) =>
+                message.id === activeTextMessageId && isEphemeralAssistantPlaceholder(message)
+                  ? {
+                      ...message,
+                      id: `${Date.now()}-command-${event.commandId}`,
+                      status: undefined,
+                      activityStatusLabel: undefined,
+                      command: {
+                        id: event.commandId,
+                        command: event.command,
+                        output: "",
+                        running: true,
+                        startedAt: Date.now(),
+                      },
+                    }
+                  : message,
+              ),
               {
                 id: nextAssistantId,
                 role: "assistant",
@@ -3770,6 +3850,23 @@ export function App() {
                 : message,
             ),
           }));
+          return;
+        }
+
+        if (event.type === "command-review-request") {
+          if (autoCollapseToolGroups) {
+            const toolGroupToCollapse = findLatestToolGroupId(
+              sessions.find((s) => s.id === currentSessionId)?.messages ?? [],
+            );
+            if (toolGroupToCollapse) {
+              setCollapsedToolGroups((current) => ({ ...current, [toolGroupToCollapse]: true }));
+            }
+          }
+          if (commandReviewMode) {
+            setPendingCommandReview({ reviewId: event.reviewId, command: event.command, cwd: event.cwd });
+          } else {
+            void getCogent()?.approveCommandReview(event.reviewId);
+          }
           return;
         }
 
@@ -3945,7 +4042,7 @@ export function App() {
           });
         }
 
-        if (event.type === "file-delete" || event.type === "directory-delete") {
+        if (event.type === "file-delete" || event.type === "directory-delete" || event.type === "file-move") {
           if (event.type === "file-delete" && selectedFile?.path === event.path) {
             setIsEditorOpen(false);
             setShouldAutoOpenEditor(false);
@@ -3954,24 +4051,28 @@ export function App() {
             setSaveState("idle");
           }
 
-          if (event.type === "file-delete" || event.type === "directory-delete") {
-            const metaLine =
-              event.type === "directory-delete"
-                ? text.directoryDelete(getFileName(event.path))
-                : text.fileDelete(getFileName(event.path));
-            updateSessionById(currentSessionId, (session) => ({
-              ...session,
-              messages: session.messages.map((message) =>
-                message.id === activeTextMessageId
-                  ? {
-                      ...message,
-                      status: "thinking",
-                      meta: metaLine ? [...(message.meta ?? []), metaLine] : message.meta,
-                    }
-                  : message,
-              ),
-            }));
+          if (event.type === "file-move" && selectedFile?.path === event.fromPath) {
+            setSelectedFile((current) => (current ? { ...current, path: event.toPath } : current));
           }
+
+          const metaLine =
+            event.type === "directory-delete"
+              ? text.directoryDelete(getFileName(event.path))
+              : event.type === "file-move"
+                ? text.fileMove(getFileName(event.fromPath), getFileName(event.toPath))
+                : text.fileDelete(getFileName(event.path));
+          updateSessionById(currentSessionId, (session) => ({
+            ...session,
+            messages: session.messages.map((message) =>
+              message.id === activeTextMessageId
+                ? {
+                    ...message,
+                    status: "thinking",
+                    meta: metaLine ? [...(message.meta ?? []), metaLine] : message.meta,
+                  }
+                : message,
+            ),
+          }));
 
           void cogent.getFileTree().then((tree) => {
             setFileTree(tree.children ?? []);
@@ -4185,6 +4286,7 @@ export function App() {
     setOllamaContextLengthDraft(ollamaContextLength);
     setLmStudioContextLengthDraft(lmStudioContextLength);
     setAutoCollapseToolGroupsDraft(autoCollapseToolGroups);
+    setCommandReviewModeDraft(commandReviewMode);
     setIsSettingsOpen(true);
   }
 
@@ -4203,6 +4305,13 @@ export function App() {
     setIsResetWarningVisible(false);
     window.setTimeout(() => {
       setIsResetWarningOpen(false);
+    }, 200);
+  }
+
+  function handleCloseCommandReview() {
+    setIsCommandReviewVisible(false);
+    window.setTimeout(() => {
+      setPendingCommandReview(null);
     }, 200);
   }
 
@@ -4392,6 +4501,7 @@ export function App() {
     setLmStudioContextLength(normalizedLmStudioContextLength);
     setLmStudioContextLengthDraft(normalizedLmStudioContextLength);
     setAutoCollapseToolGroups(autoCollapseToolGroupsDraft);
+    setCommandReviewMode(commandReviewModeDraft);
     if (typeof window !== "undefined") {
       if (normalizedKey) {
         window.localStorage.setItem(GEMINI_API_KEY_STORAGE_KEY, normalizedKey);
@@ -5279,6 +5389,20 @@ export function App() {
                 <span className="settings-switch-knob" />
               </button>
             </label>
+            <label className="settings-toggle">
+              <span className="settings-toggle-copy">
+                <span className="settings-label">{text.settingsCommandReviewLabel}</span>
+                <span className="settings-description">{text.settingsCommandReviewDescription}</span>
+              </span>
+              <button
+                type="button"
+                className={`settings-switch ${commandReviewModeDraft ? "is-on" : ""}`}
+                onClick={() => setCommandReviewModeDraft((current) => !current)}
+                aria-pressed={commandReviewModeDraft}
+              >
+                <span className="settings-switch-knob" />
+              </button>
+            </label>
             <div className="settings-toggle settings-danger-row">
               <span className="settings-toggle-copy">
                 <span className="settings-label">{text.settingsResetAppLabel}</span>
@@ -5756,6 +5880,67 @@ export function App() {
       {renderMenu()}
       {renderSettingsModal()}
       {renderModelSelectionWarning()}
+      {pendingCommandReview
+        ? createPortal(
+            <>
+              <button
+                className={`settings-backdrop settings-warning-backdrop ${isCommandReviewVisible ? "is-open" : "is-closing"}`}
+                aria-label={text.cancel}
+                onClick={() => {
+                  void getCogent()?.cancelCommandReview(pendingCommandReview.reviewId);
+                  handleCloseCommandReview();
+                }}
+              />
+              <section
+                className={`settings-modal settings-warning-modal ${isCommandReviewVisible ? "is-open" : "is-closing"}`}
+                aria-label={text.commandReviewTitle}
+              >
+                <div className="settings-header">
+                  <div className="settings-title-group">
+                    <strong>{text.commandReviewTitle}</strong>
+                    <p style={{ fontFamily: "monospace", wordBreak: "break-all", marginTop: 4 }}>
+                      {pendingCommandReview.cwd ? `${pendingCommandReview.cwd} $ ` : "$ "}
+                      {pendingCommandReview.command}
+                    </p>
+                  </div>
+                  <button
+                    className="settings-close"
+                    aria-label={text.cancel}
+                    onClick={() => {
+                      void getCogent()?.cancelCommandReview(pendingCommandReview.reviewId);
+                      handleCloseCommandReview();
+                    }}
+                  >
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                      <path d="M12 4L4 12M4 4l8 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                    </svg>
+                  </button>
+                </div>
+                <div className="settings-actions settings-warning-actions">
+                  <button
+                    className="settings-secondary"
+                    onClick={() => {
+                      void getCogent()?.cancelCommandReview(pendingCommandReview.reviewId);
+                      handleCloseCommandReview();
+                    }}
+                  >
+                    {text.cancel}
+                  </button>
+                  <button
+                    className="settings-primary"
+                    onClick={() => {
+                      void getCogent()?.approveCommandReview(pendingCommandReview.reviewId);
+                      handleCloseCommandReview();
+                    }}
+                  >
+                    {text.commandReviewApprove}
+                  </button>
+                </div>
+              </section>
+            </>,
+            document.body,
+          )
+        : null}
       {contextUsageTooltip}
     </div>
   );

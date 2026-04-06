@@ -46,6 +46,10 @@ contextBridge.exposeInMainWorld("cogent", {
     ipcRenderer.invoke("agent:browser-assist-complete", payload),
   cancelBrowserAssist: async (requestId: string): Promise<{ canceled: boolean }> =>
     ipcRenderer.invoke("agent:browser-assist-cancel", requestId),
+  approveCommandReview: async (reviewId: string): Promise<{ approved: boolean }> =>
+    ipcRenderer.invoke("agent:command-review-approve", reviewId),
+  cancelCommandReview: async (reviewId: string): Promise<{ canceled: boolean }> =>
+    ipcRenderer.invoke("agent:command-review-cancel", reviewId),
   buildContextSnapshot: async (request: TaskRequest): Promise<ContextSnapshot> =>
     ipcRenderer.invoke("agent:context", request),
   buildContextUsageSnapshot: async (request: TaskRequest): Promise<ContextUsageSnapshot | null> =>

@@ -26,6 +26,7 @@
     "appId": "com.cogent.code",
     "productName": "Cogent Code",
     "asar": true,
+    "icon": "apps/desktop/renderer/public/images/logo.ico",
     "directories": {
       "output": "release"
     },
