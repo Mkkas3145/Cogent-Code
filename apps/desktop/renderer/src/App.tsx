@@ -13,6 +13,7 @@ import type {
   ModelProvider,
   ModelTier,
   OllamaModelSummary,
+  Thoroughness,
 } from "@cogent/shared-types";
 import { diffArrays as computeDiffArrays } from "diff";
 import ReactMarkdown from "react-markdown";
@@ -21,7 +22,6 @@ import { getIconUrlByName, getIconUrlForFilePath } from "vscode-material-icons";
 import { MonacoCodeEditor, type MonacoApi, type MonacoStandaloneEditor } from "./MonacoCodeEditor";
 
 type Locale = "en" | "ko" | "ja";
-type Thoroughness = "light" | "balanced" | "deep";
 type FileTreeNode = {
   name: string;
   path: string;
@@ -572,7 +572,14 @@ function formatCustomStatusLabel(locale: Locale, label: string) {
     if (label.startsWith("Typing into ")) return "브라우저 입력 중";
     if (label.startsWith("Pressing ")) return "키 누르는 중";
     if (label.startsWith("Dragging ")) return "드래그 중";
+    if (label.startsWith("Waiting for browser help: ")) return "브라우저 도움 대기 중";
     if (label === "Capturing browser screenshot") return "브라우저 캡처 중";
+    if (label === "Capturing app window") return "앱 화면 캡처 중";
+    if (label.startsWith("Capturing app window ")) return "앱 화면 캡처 중";
+    if (label.startsWith("Starting command session ")) return "명령 세션 시작 중";
+    if (label.startsWith("Sending input to command session ")) return "명령 세션 입력 중";
+    if (label.startsWith("Reading command session ")) return "명령 세션 확인 중";
+    if (label.startsWith("Stopping command session ")) return "명령 세션 종료 중";
     if (label.startsWith("Exploring ")) return `${getPathLabel(label.slice("Exploring ".length))} 탐색 중`;
     if (label.startsWith("Writing ")) return `${getPathLabel(label.slice("Writing ".length))} 파일 수정 중`;
     if (label.startsWith("Creating ")) return `${getPathLabel(label.slice("Creating ".length))} 파일 생성 중`;
@@ -587,7 +594,14 @@ function formatCustomStatusLabel(locale: Locale, label: string) {
     if (label.startsWith("Typing into ")) return "ブラウザ?入力中";
     if (label.startsWith("Pressing ")) return "キー入力中";
     if (label.startsWith("Dragging ")) return "ドラッグ中";
+    if (label.startsWith("Waiting for browser help: ")) return "ブラウザ操作を待機中";
     if (label === "Capturing browser screenshot") return "ブラウザをキャプチャ中";
+    if (label === "Capturing app window") return "アプリ画面をキャプチャ中";
+    if (label.startsWith("Capturing app window ")) return "アプリ画面をキャプチャ中";
+    if (label.startsWith("Starting command session ")) return "コマンドセッション開始中";
+    if (label.startsWith("Sending input to command session ")) return "コマンドセッション入力中";
+    if (label.startsWith("Reading command session ")) return "コマンドセッション確認中";
+    if (label.startsWith("Stopping command session ")) return "コマンドセッション終了中";
     if (label.startsWith("Exploring ")) return `${getPathLabel(label.slice("Exploring ".length))} を探索中`;
     if (label.startsWith("Writing ")) return `${getPathLabel(label.slice("Writing ".length))} を編集中`;
     if (label.startsWith("Creating ")) return `${getPathLabel(label.slice("Creating ".length))} を作成中`;
@@ -1926,6 +1940,7 @@ export function App() {
     activeFile?: string;
     openFiles: string[];
     explicitMode?: Exclude<AgentMode, "auto">;
+    thoroughness?: Thoroughness;
     modelTier: ModelTier;
     modelProvider?: ModelProvider;
     modelId?: string;
@@ -1947,6 +1962,7 @@ export function App() {
       activeFile: activeFilePath,
       openFiles: activeFilePath ? [activeFilePath] : [],
       explicitMode: modeLocked && mode !== "auto" ? mode : undefined,
+      thoroughness,
       modelTier,
       modelProvider,
       modelId:
@@ -2010,9 +2026,9 @@ export function App() {
   }
 
   async function readPromptFiles(files: File[]) {
-    const textFiles = files.filter((file) => !isImageFile(file) && isTextLikeFile(file));
+    const supportedFiles = files.filter((file) => !isImageFile(file) && isTextLikeFile(file));
     const nextFiles = await Promise.all(
-      textFiles.map(async (file) => ({
+      supportedFiles.map(async (file) => ({
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         name: file.name,
         mimeType: file.type || "text/plain",

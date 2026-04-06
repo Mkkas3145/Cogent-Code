@@ -931,6 +931,22 @@ textarea {
   margin-top: -20px;
 }
 
+.message-row:has(.tool-group-card) + .message-row:has(.status-text) {
+  margin-top: -20px;
+}
+
+.message-row:has(.status-text) + .message-row:has(.tool-group-card) {
+  margin-top: -20px;
+}
+
+.message-row:has(.message-meta) + .message-row:has(.tool-group-card) {
+  margin-top: -20px;
+}
+
+.message-row:has(.tool-group-card) + .message-row:has(.message-meta) {
+  margin-top: -20px;
+}
+
 .chat-column.is-empty {
   min-height: calc(100vh - 260px);
   justify-content: center;

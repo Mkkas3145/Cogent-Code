@@ -1,4 +1,5 @@
 export type AgentMode = "auto" | "backend" | "frontend";
+export type Thoroughness = "light" | "balanced" | "deep";
 
 export type ModelTier = "flash-lite" | "flash" | "pro";
 export type ModelProvider = "gemini" | "ollama" | "lmstudio";
@@ -74,6 +75,7 @@ export type TaskRequest = {
   selectedText?: string;
   openFiles: string[];
   explicitMode?: Exclude<AgentMode, "auto">;
+  thoroughness?: Thoroughness;
   modelTier: ModelTier;
   modelProvider?: ModelProvider;
   modelId?: string;

@@ -11,6 +11,7 @@
   ModeDecision,
   RetrievalBundle,
   TaskRequest,
+  Thoroughness,
 } from "@cogent/shared-types";
 import { totalmem } from "node:os";
 
@@ -64,6 +65,28 @@ type ToolHandlers = {
     width: number;
     height: number;
   }>;
+  captureAppWindow: (processId?: number, titleQuery?: string) => Promise<{
+    title: string;
+    mimeType: "image/png";
+    dataUrl: string;
+    width: number;
+    height: number;
+  }>;
+  startCommandSession: (
+    command: string,
+    cwd?: string,
+  ) => Promise<{ sessionId: string; pid: number | null }>;
+  sendCommandSessionInput: (
+    sessionId: string,
+    input: string,
+  ) => Promise<{ sessionId: string; sent: true }>;
+  readCommandSessionOutput: (
+    sessionId: string,
+  ) => Promise<{ sessionId: string; stdout: string; stderr: string; running: boolean }>;
+  stopCommandSession: (
+    sessionId: string,
+    force?: boolean,
+  ) => Promise<{ sessionId: string; stopped: true }>;
   requestBrowserAssist: (request: BrowserAssistRequest) => Promise<BrowserAssistResult>;
 };
 
@@ -431,9 +454,100 @@ const FILE_TOOLS = [
     },
   },
   {
+    name: "capture_app_window",
+    description:
+      "Capture a screenshot of a currently visible desktop application window so you can inspect the real rendered UI of a local program, game engine, simulator, or other app outside the browser.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        processId: {
+          type: "NUMBER",
+          description: "Optional process id of the target app. Prefer this when you launched the app yourself.",
+        },
+        titleQuery: {
+          type: "STRING",
+          description: "Optional window title hint to match the target app window. Used as a fallback or extra hint.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "start_command_session",
+    description:
+      "Start a long-running shell command session that stays alive, so you can inspect output, send more input later, or stop it explicitly.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        command: {
+          type: "STRING",
+          description: "Shell command to start.",
+        },
+        cwd: {
+          type: "STRING",
+          description: "Optional working directory. Omit to use the current workspace root.",
+        },
+      },
+      required: ["command"],
+    },
+  },
+  {
+    name: "send_command_session_input",
+    description:
+      "Send more text input to a previously started long-running command session, such as pressing Enter, answering a prompt, or sending a control sequence.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        sessionId: {
+          type: "STRING",
+          description: "Existing command session id.",
+        },
+        input: {
+          type: "STRING",
+          description: "Text to send to the command session stdin.",
+        },
+      },
+      required: ["sessionId", "input"],
+    },
+  },
+  {
+    name: "read_command_session_output",
+    description:
+      "Read the accumulated stdout and stderr of a previously started long-running command session so you can inspect its current state without stopping it.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        sessionId: {
+          type: "STRING",
+          description: "Existing command session id.",
+        },
+      },
+      required: ["sessionId"],
+    },
+  },
+  {
+    name: "stop_command_session",
+    description:
+      "Stop a previously started long-running command session. Use force=true when graceful shutdown is not working.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        sessionId: {
+          type: "STRING",
+          description: "Existing command session id.",
+        },
+        force: {
+          type: "BOOLEAN",
+          description: "When true, force-kill the process instead of asking it to exit gracefully.",
+        },
+      },
+      required: ["sessionId"],
+    },
+  },
+  {
     name: "request_browser_assistance",
     description:
-      "Ask the user to help in a live browser when human interaction is required, such as login, captcha, consent, or a visually guided step.",
+      "Ask the user to help in a live browser only when human interaction is genuinely required, such as login, captcha, consent, 2FA, account-specific choices, or another action the AI cannot legally or technically complete itself.",
     parameters: {
       type: "OBJECT",
       properties: {
@@ -631,6 +745,36 @@ function modelForTier(modelTier: TaskRequest["modelTier"]): string {
   }
 }
 
+function getEffectiveThoroughness(request: TaskRequest): Thoroughness {
+  return request.thoroughness ?? "balanced";
+}
+
+function getGeminiThinkingBudget(thoroughness: Thoroughness): number {
+  switch (thoroughness) {
+    case "light":
+      return 0;
+    case "deep":
+      return 8192;
+    default:
+      return 2048;
+  }
+}
+
+function getOpenAiReasoningEffort(thoroughness: Thoroughness): "low" | "medium" | "high" {
+  switch (thoroughness) {
+    case "light":
+      return "low";
+    case "deep":
+      return "high";
+    default:
+      return "medium";
+  }
+}
+
+function getOllamaThinkFlag(thoroughness: Thoroughness): boolean {
+  return thoroughness !== "light";
+}
+
 function buildGenerateContentPayload(
   request: TaskRequest,
   decision: ModeDecision,
@@ -638,9 +782,15 @@ function buildGenerateContentPayload(
   contents: GeminiContent[],
   includeTools: boolean,
 ) {
+  const thoroughness = getEffectiveThoroughness(request);
   return {
     system_instruction: {
       parts: [{ text: buildSystemInstruction(request, decision, retrieval) }],
+    },
+    generationConfig: {
+      thinkingConfig: {
+        thinkingBudget: getGeminiThinkingBudget(thoroughness),
+      },
     },
     ...(includeTools ? { tools: [{ functionDeclarations: FILE_TOOLS }] } : {}),
     ...(includeTools
@@ -658,6 +808,7 @@ function buildGenerateContentPayload(
 }
 
 function buildSystemInstruction(request: TaskRequest, decision: ModeDecision, retrieval: RetrievalBundle): string {
+  const thoroughness = getEffectiveThoroughness(request);
   const instructions = [
     "You are Cogent, an AI coding agent inside a desktop coding workspace.",
     "Behave like a tool-using coding agent, not a one-shot assistant.",
@@ -665,12 +816,22 @@ function buildSystemInstruction(request: TaskRequest, decision: ModeDecision, re
     "Use run_command only for shell-native tasks such as build, test, search, git, package-manager, or environment inspection.",
     "Do not use run_command for normal file editing, file creation, file deletion, or empty-folder deletion when a dedicated file tool exists.",
     "Prefer read_file, list_dir, write_file, create_file, delete_file, and delete_directory over shell commands whenever they can accomplish the task.",
+    "Do not use run_command to read files, print file contents, cat/type files, or inspect local documents when read_file or a dedicated document tool can do it directly.",
+    "For local desktop programs, game engines, simulators, or other non-browser apps, use capture_app_window to inspect the actual rendered screen when visual confirmation matters.",
+    "If you launch a local app and need to verify what is visible on screen, do not guess from logs alone. Capture the real window when possible.",
+    "Do not reach for run_command as a substitute for actually looking at a page or UI. Shell commands cannot see the rendered screen. For frontend, design, layout, or visual inspection tasks, prefer open_webpage, browser interaction tools, web_screenshot, and direct file inspection over shell commands.",
+    "If the task is to inspect, evaluate, or debug what the user can visually see, do not rely on run_command alone unless the user explicitly asked for a shell-only check.",
+    "Use start_command_session for long-running processes that may need later input, later shutdown, or parallel inspection while they keep running. Do not trap yourself in a single blocking run_command when session control is needed.",
     "Use web_search to find current information on the public web and open_webpage when you need the actual rendered contents of a page, including client-side content.",
     "After opening a page, you may use web_click, web_scroll, web_type, web_press, and web_drag to interact with the page when needed.",
     "For browser selectors, avoid brittle generated class selectors such as css-xxxxx whenever possible.",
     "Prefer stable semantic selectors based on name, id, role, aria-label, placeholder, href, type, or other durable attributes over transient styling classes.",
     "If a browser selector fails, reconsider the selector and page state instead of repeating the same brittle selector blindly.",
-    "If a browser task requires a real person, such as login, captcha, consent, or visually guided confirmation, use request_browser_assistance with a clear title, reason, helpNeeded summary, and detailed ordered steps.",
+    "Use request_browser_assistance only when a real person is genuinely required, such as login, captcha, consent, 2FA, account-specific choices, or another action the AI cannot legally or technically complete itself.",
+    "Do not use request_browser_assistance merely because the user asked you to look at a page, inspect a site, evaluate a design, check what is on screen, compare UI states, or navigate a public page. In those cases, inspect it yourself with open_webpage, browser interaction tools, web_screenshot, and related tools.",
+    "If the user asks for a design opinion, visual evaluation, or direct page inspection, prefer doing that work yourself instead of handing it back to the user.",
+    "When checking something for your own verification, prefer hidden or non-disruptive inspection paths first so the user does not have to watch or interact unless necessary.",
+    "For browser and UI verification, prefer silent inspection tools first: open_webpage, browser interaction tools, web_screenshot, capture_app_window, read_file, and command/session output. Only surface a visible user-facing help flow when those hidden or background paths are not sufficient.",
     "Browser assistance results are only candidate observations. You must decide yourself whether the browser task is truly complete from the returned page snapshot.",
     "Only treat a browser-assisted task as complete when you are highly confident from the actual screen contents that the requested goal was really reached. If there is any real doubt, do not say it is done yet.",
     "When deciding whether a browser-assisted task is complete, analyze the actual returned browser page content, title, URL, and visible clues on the screen. Do not decide based only on the fact that the panel closed or that some interaction happened.",
@@ -679,9 +840,11 @@ function buildSystemInstruction(request: TaskRequest, decision: ModeDecision, re
     "Do not pretend that a file was read or written unless you actually called the tool and received the result.",
     "Never claim that work is finished, fixed, saved, created, or deleted unless the relevant tool actually succeeded.",
     "If a command exits non-zero or any tool returns an error, do not present the task as complete. Explain that it failed and what remains blocked.",
+    "Treat any failed run_command as unresolved work by default. Either recover, retry with a better approach, or clearly explain the blocker; do not silently move on as if the command had succeeded.",
     "Before claiming that a file or folder changed state, rely on the tool result, and if there is any doubt, verify by reading the file again or listing the directory again.",
     "If a verification step fails or is impossible, say that clearly instead of implying success.",
     "For any meaningful edit, creation, deletion, command run, or browser task, perform an explicit verification step before saying it worked whenever verification is reasonably possible.",
+    "After a failed command, perform a follow-up reasoning step: inspect the error, decide whether to retry or switch tools, and mention that decision in the assistant body instead of letting the failure disappear.",
     "Do not stop at the first successful tool call. If the user asked for a change, verify the resulting state and only then describe it as done.",
     "Do not end the task at an ambiguous halfway point. Continue until the requested work is actually completed, clearly blocked, or explicitly handed back to the user for a specific reason.",
     "A successful tool call is not the finish line. Finishing requires the underlying user request to be satisfied, not merely a partial action to have happened.",
@@ -705,6 +868,13 @@ function buildSystemInstruction(request: TaskRequest, decision: ModeDecision, re
     "Always leave at least one conversational body line before finishing a turn, even when the task is blocked, handed off to the user, or waiting for browser assistance.",
     "Do not end a turn with only tool output, status changes, or UI actions. Leave a short plain-language message that explains the current state and what comes next.",
     "This applies to every turn without exception: never finish with zero assistant body text.",
+    "Before finishing, perform and describe an explicit verification step whenever it is reasonably possible.",
+    "Before finish_turn, briefly review the outcome, mention remaining risk, and state whether anything still deserves follow-up.",
+    thoroughness === "light"
+      ? "Requested thoroughness is light. Move faster, but still verify important results before claiming success."
+      : thoroughness === "deep"
+        ? "Requested thoroughness is deep. Inspect more carefully, verify more aggressively, and prefer stronger confirmation before moving on."
+        : "Requested thoroughness is balanced. Keep speed and care in balance.",
     decision.mode === "auto"
       ? "Preferred mode: auto. Decide the best workflow yourself from the user's request and tool results."
       : `Preferred mode: ${decision.mode}.`,
@@ -723,6 +893,23 @@ function buildSystemInstruction(request: TaskRequest, decision: ModeDecision, re
   if (globalSystemPrompt) {
     instructions.push(`Additional global system prompt:\n${globalSystemPrompt}`);
   }
+
+  const hasAttachedImages =
+    (request.currentPromptImages?.length ?? 0) > 0 ||
+    (request.conversation?.some((turn) => (turn.images?.length ?? 0) > 0) ?? false);
+  const canDirectlyViewImages = request.modelProvider === "gemini" && hasAttachedImages;
+  if (canDirectlyViewImages) {
+    instructions.push(
+      "Attached images are available to you directly in this multimodal turn. If the user wants you to inspect, read, identify, compare, or verify something in an image, actually use the attached image input and answer from what you can see. Do not pretend to have seen the image without using it, and do not claim you cannot view the image when it is attached here. If the image is ambiguous, say what is unclear instead of bluffing.",
+    );
+  }
+  instructions.push(
+    "If the user wants you to directly look at something, visually inspect a page, judge a design, compare a UI, or verify what is actually on screen, do not merely infer from memory or code when a direct inspection path is available. Prefer the real source of truth: attached multimodal images when present, open_webpage plus browser tools for live pages, web_screenshot when a visual capture helps, and read_file for the exact source files. Base your answer on what you actually inspected, and say clearly when you are inferring instead of directly seeing.",
+  );
+  instructions.push(
+  );
+  instructions.push(
+  );
 
   return instructions.join("\n\n");
 }
@@ -921,6 +1108,7 @@ async function requestOllamaChat(
   includeTools: boolean,
   signal?: AbortSignal,
 ): Promise<OllamaChatResponse> {
+  const thoroughness = getEffectiveThoroughness(request);
   const response = await fetch("http://127.0.0.1:11434/api/chat", {
     method: "POST",
     headers: {
@@ -931,6 +1119,7 @@ async function requestOllamaChat(
       model: getEffectiveModelName(request),
       stream: false,
       messages,
+      think: getOllamaThinkFlag(thoroughness),
       options: (request.ollamaContextLength || getDefaultLocalContextLength(totalmem()))
         ? {
             num_ctx: request.ollamaContextLength || getDefaultLocalContextLength(totalmem()),
@@ -990,6 +1179,7 @@ async function requestLmStudioChat(
   includeTools: boolean,
   signal?: AbortSignal,
 ): Promise<OpenAiChatCompletionResponse> {
+  const thoroughness = getEffectiveThoroughness(request);
   const response = await fetch("http://127.0.0.1:1234/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -1000,6 +1190,7 @@ async function requestLmStudioChat(
       model: getEffectiveModelName(request),
       stream: false,
       messages,
+      reasoning_effort: getOpenAiReasoningEffort(thoroughness),
       ...(includeTools ? { tools: OPENAI_TOOL_DEFINITIONS, tool_choice: "auto" } : {}),
     }),
   });
@@ -1515,6 +1706,84 @@ async function* executeToolCall(
     const heightArg = typeof call.args.height === "number" ? call.args.height : 0;
     yield { type: "status", label: `Resizing browser to ${widthArg}x${heightArg}` };
     const result = await handlers.resizeWebpage(widthArg, heightArg);
+    return {
+      functionResponse: {
+        name: call.name,
+        response: {
+          result,
+        },
+      },
+    };
+  }
+
+  if (call.name === "capture_app_window") {
+    const processIdArg = typeof call.args.processId === "number" ? call.args.processId : undefined;
+    const titleQueryArg = typeof call.args.titleQuery === "string" ? call.args.titleQuery : undefined;
+    yield { type: "status", label: titleQueryArg ? `Capturing app window ${titleQueryArg}` : "Capturing app window" };
+    const result = await handlers.captureAppWindow(processIdArg, titleQueryArg);
+    return {
+      functionResponse: {
+        name: call.name,
+        response: {
+          result,
+        },
+      },
+    };
+  }
+
+  if (call.name === "start_command_session") {
+    const commandArg = typeof call.args.command === "string" ? call.args.command : "";
+    const cwdArg = typeof call.args.cwd === "string" ? call.args.cwd : undefined;
+    yield { type: "status", label: `Starting command session ${commandArg}` };
+    const result = await handlers.startCommandSession(commandArg, cwdArg);
+    return {
+      functionResponse: {
+        name: call.name,
+        response: {
+          result: {
+            ...result,
+            command: commandArg,
+            cwd: cwdArg,
+          },
+        },
+      },
+    };
+  }
+
+  if (call.name === "send_command_session_input") {
+    const sessionIdArg = typeof call.args.sessionId === "string" ? call.args.sessionId : "";
+    const inputArg = typeof call.args.input === "string" ? call.args.input : "";
+    yield { type: "status", label: `Sending input to command session ${sessionIdArg}` };
+    const result = await handlers.sendCommandSessionInput(sessionIdArg, inputArg);
+    return {
+      functionResponse: {
+        name: call.name,
+        response: {
+          result,
+        },
+      },
+    };
+  }
+
+  if (call.name === "read_command_session_output") {
+    const sessionIdArg = typeof call.args.sessionId === "string" ? call.args.sessionId : "";
+    yield { type: "status", label: `Reading command session ${sessionIdArg}` };
+    const result = await handlers.readCommandSessionOutput(sessionIdArg);
+    return {
+      functionResponse: {
+        name: call.name,
+        response: {
+          result,
+        },
+      },
+    };
+  }
+
+  if (call.name === "stop_command_session") {
+    const sessionIdArg = typeof call.args.sessionId === "string" ? call.args.sessionId : "";
+    const forceArg = typeof call.args.force === "boolean" ? call.args.force : false;
+    yield { type: "status", label: `Stopping command session ${sessionIdArg}` };
+    const result = await handlers.stopCommandSession(sessionIdArg, forceArg);
     return {
       functionResponse: {
         name: call.name,

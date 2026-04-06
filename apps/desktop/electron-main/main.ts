@@ -3,8 +3,10 @@ import { execFile } from "node:child_process";
 import { mkdir, readFile, readdir, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { desktopCapturer } from "electron";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { buildContextSnapshot, buildContextUsageSnapshot, runAgentTask } from "@cogent/agent-core";
 import { streamCommand } from "@cogent/command-runtime";
 import type {
@@ -44,6 +46,16 @@ const pendingBrowserAssistRequests = new Map<
     reject: (error: Error) => void;
   }
 >();
+const activeCommandSessions = new Map<
+  string,
+  {
+    process: ChildProcessWithoutNullStreams;
+    cwd: string;
+    command: string;
+    stdout: string;
+    stderr: string;
+  }
+>();
 const preloadPath = isDev
   ? path.resolve(currentDir, "..", "..", "..", "..", "desktop", "electron-main", "preload.cjs")
   : path.join(app.getAppPath(), "apps", "desktop", "electron-main", "preload.cjs");
@@ -53,6 +65,180 @@ function delay(ms: number) {
   return new Promise<void>((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function createShellChild(command: string, cwd?: string) {
+  const isWindows = process.platform === "win32";
+  const normalizedCommand = isWindows
+    ? `[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); chcp 65001 > $null; ${command}`
+    : command;
+
+  const child = isWindows
+    ? spawn(
+        "powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", normalizedCommand],
+        { cwd },
+      )
+    : spawn("/bin/sh", ["-lc", normalizedCommand], { cwd });
+
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  return child;
+}
+
+async function getProcessWindowHint(processId: number): Promise<{ handle: string | null; title: string | null }> {
+  if (process.platform !== "win32") {
+    return { handle: null, title: null };
+  }
+
+  try {
+    const script =
+      `$process = Get-Process -Id ${processId} -ErrorAction Stop; ` +
+      `[pscustomobject]@{ Handle = [string]$process.MainWindowHandle; Title = [string]$process.MainWindowTitle } | ConvertTo-Json -Compress`;
+    const { stdout } = await execFileAsync("powershell.exe", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      script,
+    ]);
+    const parsed = JSON.parse(stdout.trim()) as { Handle?: string; Title?: string };
+    return {
+      handle: parsed.Handle?.trim() ? parsed.Handle.trim() : null,
+      title: parsed.Title?.trim() ? parsed.Title.trim() : null,
+    };
+  } catch {
+    return { handle: null, title: null };
+  }
+}
+
+async function captureAppWindow(processId?: number, titleQuery?: string) {
+  const normalizeWindowTitle = (value: string) =>
+    value
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .replace(/[^\p{L}\p{N}\s._-]/gu, "")
+      .trim();
+  const normalizedQuery = normalizeWindowTitle(titleQuery?.trim() ?? "");
+  const processWindowHint = typeof processId === "number" && Number.isFinite(processId) ? await getProcessWindowHint(processId) : null;
+  const sources = await desktopCapturer.getSources({
+    types: ["window"],
+    thumbnailSize: { width: 1600, height: 900 },
+    fetchWindowIcons: false,
+  });
+
+  const visibleSources = sources.filter((source) => source.name && source.thumbnail && !source.thumbnail.isEmpty());
+  const sourceHandleFor = (source: Electron.DesktopCapturerSource) => {
+    const match = source.id.match(/^window:(.+?):/i);
+    return match?.[1] ?? null;
+  };
+  const scoreSource = (sourceName: string) => {
+    const normalizedSourceName = normalizeWindowTitle(sourceName);
+    if (!normalizedQuery) {
+      return 0;
+    }
+    if (normalizedSourceName === normalizedQuery) {
+      return 1000;
+    }
+    if (normalizedSourceName.startsWith(normalizedQuery)) {
+      return 700;
+    }
+    if (normalizedSourceName.includes(normalizedQuery)) {
+      return 500;
+    }
+
+    const queryTokens = normalizedQuery.split(" ").filter(Boolean);
+    const sourceTokens = new Set(normalizedSourceName.split(" ").filter(Boolean));
+    const tokenHits = queryTokens.filter((token) => sourceTokens.has(token)).length;
+    if (tokenHits === 0) {
+      return 0;
+    }
+    return 100 + tokenHits * 50;
+  };
+
+  const byAreaDescending = (left: Electron.DesktopCapturerSource, right: Electron.DesktopCapturerSource) => {
+    const leftSize = left.thumbnail.getSize();
+    const rightSize = right.thumbnail.getSize();
+    return rightSize.width * rightSize.height - leftSize.width * leftSize.height;
+  };
+
+  let preferredSource: Electron.DesktopCapturerSource | undefined;
+  if (processWindowHint?.handle) {
+    preferredSource = visibleSources.find((source) => sourceHandleFor(source) === processWindowHint.handle);
+  }
+
+  if (!preferredSource && processWindowHint?.title) {
+    const normalizedProcessTitle = normalizeWindowTitle(processWindowHint.title);
+    preferredSource = visibleSources.find((source) => normalizeWindowTitle(source.name) === normalizedProcessTitle);
+  }
+
+  if (!preferredSource && normalizedQuery) {
+    const rankedSources = visibleSources
+      .map((source) => ({ source, score: scoreSource(source.name) }))
+      .filter((entry) => entry.score > 0)
+      .sort((left, right) => {
+        if (right.score !== left.score) {
+          return right.score - left.score;
+        }
+        return byAreaDescending(left.source, right.source);
+      });
+
+    if (rankedSources.length === 0) {
+      throw new Error(
+        processId
+          ? `No application window matched process ${processId}${titleQuery ? ` or title ${titleQuery}` : ""}`
+          : `No application window matched title: ${titleQuery}`,
+      );
+    }
+
+    const [best, secondBest] = rankedSources;
+    if (secondBest && best.score === secondBest.score && best.score < 1000) {
+      throw new Error(`Application window title is ambiguous: ${titleQuery}`);
+    }
+
+    preferredSource = best.source;
+  } else {
+    preferredSource =
+      [...visibleSources]
+        .filter((source) => !source.name.toLowerCase().includes("cogent code"))
+        .sort(byAreaDescending)[0] ?? visibleSources.sort(byAreaDescending)[0];
+  }
+
+  if (!preferredSource) {
+    throw new Error("No capturable application window was found.");
+  }
+
+  const png = preferredSource.thumbnail.toPNG();
+  return {
+    title: preferredSource.name,
+    mimeType: "image/png" as const,
+    dataUrl: `data:image/png;base64,${png.toString("base64")}`,
+    width: preferredSource.thumbnail.getSize().width,
+    height: preferredSource.thumbnail.getSize().height,
+  };
+}
+
+function toPowerShellLiteral(value: string) {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+async function runPowerShellJson<T>(script: string): Promise<T> {
+  const { stdout, stderr } = await execFileAsync("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    script,
+  ]);
+
+  const trimmed = stdout.trim();
+  if (!trimmed) {
+    throw new Error(stderr.trim() || "PowerShell returned no output.");
+  }
+
+  return JSON.parse(trimmed) as T;
 }
 
 function buildResolveElementScript(selector: string, options?: { focus?: boolean; clear?: boolean }) {
@@ -1171,6 +1357,67 @@ app.whenReady().then(async () => {
     },
     screenshotWebpage: async () => {
       return browserSession.screenshot();
+    },
+    captureAppWindow: async (processId?: number, titleQuery?: string) => {
+      return captureAppWindow(processId, titleQuery);
+    },
+    startCommandSession: async (command: string, cwd?: string) => {
+      const resolvedCwd = cwd ? resolveToolPath(cwd, rootPath) : rootPath;
+      const child = createShellChild(command, resolvedCwd);
+      const sessionId = `command-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const session = {
+        process: child,
+        cwd: resolvedCwd,
+        command,
+        stdout: "",
+        stderr: "",
+      };
+      child.stdout.on("data", (chunk: string) => {
+        session.stdout = `${session.stdout}${chunk}`.slice(-20000);
+      });
+      child.stderr.on("data", (chunk: string) => {
+        session.stderr = `${session.stderr}${chunk}`.slice(-20000);
+      });
+      activeCommandSessions.set(sessionId, session);
+      child.once("close", () => {
+        activeCommandSessions.delete(sessionId);
+      });
+      return { sessionId, pid: child.pid ?? null };
+    },
+    sendCommandSessionInput: async (sessionId: string, input: string) => {
+      const session = activeCommandSessions.get(sessionId);
+      if (!session) {
+        throw new Error(`Command session not found: ${sessionId}`);
+      }
+      session.process.stdin.write(input);
+      return { sessionId, sent: true as const };
+    },
+    readCommandSessionOutput: async (sessionId: string) => {
+      const session = activeCommandSessions.get(sessionId);
+      if (!session) {
+        throw new Error(`Command session not found: ${sessionId}`);
+      }
+      return {
+        sessionId,
+        stdout: session.stdout,
+        stderr: session.stderr,
+        running: !session.process.killed,
+      };
+    },
+    stopCommandSession: async (sessionId: string, force?: boolean) => {
+      const session = activeCommandSessions.get(sessionId);
+      if (!session) {
+        throw new Error(`Command session not found: ${sessionId}`);
+      }
+      if (force) {
+        session.process.kill("SIGKILL");
+      } else if (process.platform === "win32") {
+        session.process.stdin.write("\u0003");
+      } else {
+        session.process.kill("SIGTERM");
+      }
+      activeCommandSessions.delete(sessionId);
+      return { sessionId, stopped: true as const };
     },
     requestBrowserAssist: async (request: BrowserAssistRequest) => {
       return new Promise<BrowserAssistResult>((resolve, reject) => {
