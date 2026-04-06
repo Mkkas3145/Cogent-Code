@@ -1694,6 +1694,26 @@ app.whenReady().then(async () => {
     return { opened: true };
   });
 
+  ipcMain.handle("system:open-console-window", async (event) => {
+    const target = BrowserWindow.fromWebContents(event.sender);
+    const currentRoot = target ? (windowWorkspaceRoots.get(target.id) ?? workspaceRoot) : workspaceRoot;
+
+    if (process.platform === "win32") {
+      const startIn = currentRoot.replace(/'/g, "''");
+      await execFileAsync("powershell.exe", [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        `Start-Process cmd.exe -WorkingDirectory '${startIn}'`,
+      ]);
+      return { opened: true as const };
+    }
+
+    throw new Error("Console window opening is currently supported on Windows only.");
+  });
+
   ipcMain.handle("system:file-tree", async (event) => {
     const target = BrowserWindow.fromWebContents(event.sender);
     const rootPath = target ? (windowWorkspaceRoots.get(target.id) ?? workspaceRoot) : workspaceRoot;

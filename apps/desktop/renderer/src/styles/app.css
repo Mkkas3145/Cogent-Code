@@ -2096,6 +2096,10 @@ textarea {
   transform: translateY(6px) scale(0.96);
 }
 
+.dropdown-menu-files.dropdown-menu-down {
+  transform: scale(0.96);
+}
+
 .dropdown-menu.is-open {
   opacity: 1;
 }
@@ -2110,6 +2114,10 @@ textarea {
 
 .dropdown-menu-down.is-open {
   transform: translateY(10px) scale(1);
+}
+
+.dropdown-menu-files.dropdown-menu-down.is-open {
+  transform: scale(1);
 }
 
 .dropdown-menu.is-closing {

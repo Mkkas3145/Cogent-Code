@@ -43,6 +43,7 @@ contextBridge.exposeInMainWorld("cogent", {
   openFolder: async () => ipcRenderer.invoke("system:open-folder"),
   openPath: async (targetPath) => ipcRenderer.invoke("system:open-path", targetPath),
   openNewWindow: async () => ipcRenderer.invoke("system:new-window"),
+  openConsoleWindow: async () => ipcRenderer.invoke("system:open-console-window"),
   getFileTree: async () => ipcRenderer.invoke("system:file-tree"),
   readFile: async (filePath) => ipcRenderer.invoke("system:read-file", filePath),
   writeFile: async (request) => ipcRenderer.invoke("system:write-file", request),

@@ -1165,6 +1165,8 @@ const COPY = {
     openFolderDescription: "Open an existing project folder and jump straight into the workspace.",
     newWindowTitle: "New Window",
     newWindowDescription: "Start another workspace in a separate window.",
+    openConsoleTitle: "Open Command Prompt in New Window",
+    openConsoleDescription: "Open a new Command Prompt window rooted at the current workspace folder.",
     settingsTitle: "Settings",
     settingsDescription: "Adjust app behavior and connected services.",
     settingsClose: "Close settings",
@@ -1272,6 +1274,8 @@ const COPY = {
     openFolderDescription: "기존 프로젝트 폴더를 열고 바로 작업을 이어갑니다.",
     newWindowTitle: "새 창",
     newWindowDescription: "별도의 창에서 다른 워크스페이스를 시작합니다.",
+    openConsoleTitle: "새 명령 프롬프트 창 열기",
+    openConsoleDescription: "현재 워크스페이스 폴더 기준으로 새 명령 프롬프트 창을 엽니다.",
     settingsTitle: "설정",
     settingsDescription: "앱 동작과 연결된 서비스를 조정합니다.",
     settingsClose: "설정 닫기",
@@ -1379,6 +1383,8 @@ const COPY = {
     openFolderDescription: "?存のプロジェクトフォルダ?を開いて、すぐに作業を?けます。",
     newWindowTitle: "新しいウィンドウ",
     newWindowDescription: "別のウィンドウで別のワ?クスペ?スを開始します。",
+    openConsoleTitle: "新しいコマンドプロンプトを開く",
+    openConsoleDescription: "現在のワ?クスペ?スを基準に新しいコマンドプロンプトを開きます。",
     settingsTitle: "設定",
     settingsDescription: "アプリの動作と接?サ?ビスを調整します。",
     settingsClose: "設定を閉じる",
@@ -1543,6 +1549,7 @@ declare global {
       openFolder: () => Promise<{ rootPath: string; name: string } | null>;
       openPath: (targetPath: string) => Promise<OpenPathResult>;
       openNewWindow: () => Promise<{ opened: boolean }>;
+      openConsoleWindow: () => Promise<{ opened: boolean }>;
       getFileTree: () => Promise<{ rootPath: string; name: string; children: FileTreeNode[] }>;
       readFile: (filePath: string) => Promise<FilePreview>;
       writeFile: (request: { filePath: string; content: string }) => Promise<{ path: string; saved: boolean }>;
@@ -2962,12 +2969,12 @@ export function App() {
       const estimatedMenuWidth = 220;
       const viewportPadding = 12;
       const titlebarHeight = 40;
-      const verticalOffset = activeMenu === "files" ? 10 : 10;
+      const verticalOffset = 10;
       const left = Math.min(
         Math.max(viewportPadding, rect.left),
         window.innerWidth - estimatedMenuWidth - viewportPadding,
       );
-      const top = Math.max(titlebarHeight + viewportPadding, activeMenu === "files" ? rect.bottom : rect.top);
+      const top = Math.max(titlebarHeight + viewportPadding, activeMenu === "files" ? rect.bottom + 10 : rect.top);
       const availableHeight =
         activeMenu === "files"
           ? window.innerHeight - rect.bottom - viewportPadding - verticalOffset
@@ -4161,6 +4168,16 @@ export function App() {
     closeMenu();
   }
 
+  async function handleOpenConsoleWindow() {
+    const cogent = getCogent();
+    if (!cogent) {
+      return;
+    }
+
+    await cogent.openConsoleWindow();
+    closeMenu();
+  }
+
   function handleOpenSettings() {
     closeMenu();
     setGeminiApiKeyDraft(geminiApiKey);
@@ -5042,6 +5059,13 @@ export function App() {
           </button>
           <button
             className="menu-item file-menu-item"
+            onClick={() => void handleOpenConsoleWindow()}
+          >
+            <span className="menu-item-title">{text.openConsoleTitle}</span>
+            <span className="menu-item-description">{text.openConsoleDescription}</span>
+          </button>
+          <button
+            className="menu-item file-menu-item"
             onClick={handleOpenSettings}
           >
             <span className="menu-item-title">{text.settingsTitle}</span>
@@ -5139,7 +5163,7 @@ export function App() {
         <div
           className={`dropdown-menu dropdown-menu-floating ${
             visibleMenu === "files" ? "dropdown-menu-down" : "dropdown-menu-up"
-          } ${openMenu ? (menuVisible ? "is-open" : "is-entering") : "is-closing"}`}
+          } ${visibleMenu === "files" ? "dropdown-menu-files" : ""} ${openMenu ? (menuVisible ? "is-open" : "is-entering") : "is-closing"}`}
           style={{
             left: `${menuPosition.left}px`,
             top: `${menuPosition.top}px`,

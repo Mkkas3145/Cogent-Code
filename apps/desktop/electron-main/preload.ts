@@ -62,6 +62,14 @@ contextBridge.exposeInMainWorld("cogent", {
     ipcRenderer.invoke("system:lmstudio-models"),
   cleanupLocalModels: async (payload: { provider?: "ollama" | "lmstudio" | "gemini"; modelId?: string }): Promise<{ cleaned: boolean }> =>
     ipcRenderer.invoke("system:cleanup-local-models", payload),
+  getWorkspaceInfo: async (): Promise<{ rootPath: string; name: string }> => ipcRenderer.invoke("system:workspace-info"),
+  openFolder: async (): Promise<{ rootPath: string; name: string } | null> => ipcRenderer.invoke("system:open-folder"),
+  openPath: async (targetPath: string) => ipcRenderer.invoke("system:open-path", targetPath),
+  openNewWindow: async (): Promise<{ opened: boolean }> => ipcRenderer.invoke("system:new-window"),
+  openConsoleWindow: async (): Promise<{ opened: boolean }> => ipcRenderer.invoke("system:open-console-window"),
+  getFileTree: async () => ipcRenderer.invoke("system:file-tree"),
+  readFile: async (filePath: string) => ipcRenderer.invoke("system:read-file", filePath),
+  writeFile: async (request: { filePath: string; content: string }) => ipcRenderer.invoke("system:write-file", request),
   windowControls: {
     minimize: async (): Promise<void> => ipcRenderer.invoke("window:minimize"),
     maximizeToggle: async (): Promise<{ maximized: boolean }> => ipcRenderer.invoke("window:maximize-toggle"),
