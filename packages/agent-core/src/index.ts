@@ -1203,6 +1203,30 @@ async function requestLmStudioChat(
   return (await response.json()) as OpenAiChatCompletionResponse;
 }
 
+async function requestLmStudioChatWithRetry(
+  request: TaskRequest,
+  messages: OpenAiChatMessage[],
+  includeTools: boolean,
+  signal?: AbortSignal,
+): Promise<OpenAiChatCompletionResponse> {
+  const maxAttempts = 3;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await requestLmStudioChat(request, messages, includeTools, signal);
+    } catch (error) {
+      lastError = error;
+      if (signal?.aborted || (error instanceof Error && error.name === "AbortError") || attempt >= maxAttempts) {
+        throw error;
+      }
+      await sleep(700 * attempt, signal);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("LM Studio chat request failed.");
+}
+
 function parseOpenAiToolCalls(
   response: OpenAiChatCompletionResponse,
 ): Array<{ id?: string; name: string; args: Record<string, unknown> }> {
@@ -1832,6 +1856,31 @@ async function* executeToolCall(
   };
 }
 
+async function* requestOllamaStreamWithRetry(
+  request: TaskRequest,
+  messages: OllamaMessage[],
+  includeTools: boolean,
+  signal?: AbortSignal,
+): AsyncGenerator<{ type: "text"; delta: string } | { type: "response"; response: OllamaChatResponse }> {
+  const maxAttempts = 3;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      yield* requestOllamaStream(request, messages, includeTools, signal);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (signal?.aborted || (error instanceof Error && error.name === "AbortError") || attempt >= maxAttempts) {
+        throw error;
+      }
+      await sleep(700 * attempt, signal);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Ollama stream request failed.");
+}
+
 function parseOllamaToolCalls(message: OllamaChatResponse["message"]): Array<{ name: string; args: Record<string, unknown> }> {
   return (message?.tool_calls ?? []).flatMap((toolCall) => {
     const name = toolCall.function?.name;
@@ -1862,25 +1911,6 @@ function getFinishTurnPayload(args: Record<string, unknown>) {
   return { message, summary };
 }
 
-async function waitUntilAborted(signal?: AbortSignal) {
-  if (!signal) {
-    await new Promise<never>(() => {});
-    return;
-  }
-
-  if (signal.aborted) {
-    return;
-  }
-
-  await new Promise<void>((resolve) => {
-    const handleAbort = () => {
-      signal.removeEventListener("abort", handleAbort);
-      resolve();
-    };
-
-    signal.addEventListener("abort", handleAbort, { once: true });
-  });
-}
 
 function buildOllamaMessages(
   request: TaskRequest,
@@ -1917,6 +1947,224 @@ function getModelProvider(request: TaskRequest): ModelProvider {
   return request.modelProvider ?? "gemini";
 }
 
+const COMPRESSION_KEEP_RECENT = 20;
+const CHARS_PER_TOKEN = 4;
+const GEMINI_MAX_CONTEXT_TOKENS = 1_000_000;
+const LMSTUDIO_DEFAULT_MAX_CONTEXT_TOKENS = 32_768;
+
+// Predictive compression settings:
+// Look this many turns ahead when estimating future context size.
+const COMPRESSION_LOOKAHEAD_TURNS = 4;
+// Trigger compression when the projected size would exceed this fraction of the max.
+const CONTEXT_PROJECTED_LIMIT_RATIO = 0.90;
+// Never trigger compression before reaching this minimum fraction (avoid thrashing on small contexts).
+const CONTEXT_MIN_RATIO_TO_COMPRESS = 0.30;
+// Exponential moving average weight for per-turn growth estimates.
+const GROWTH_EMA_ALPHA = 0.4;
+
+function estimateGeminiContextChars(contents: GeminiContent[]): number {
+  return contents.reduce((sum, c) => sum + getTextFromParts(c.parts ?? []).length, 0);
+}
+
+function estimateOllamaContextChars(messages: OllamaMessage[]): number {
+  return messages.reduce((sum, m) => sum + m.content.length, 0);
+}
+
+function estimateOpenAiContextChars(messages: OpenAiChatMessage[]): number {
+  return messages.reduce((sum, m) => {
+    const text = typeof m.content === "string" ? m.content : m.content.map((c) => c.text).join("");
+    return sum + text.length;
+  }, 0);
+}
+
+function getGeminiMaxContextChars(): number {
+  return GEMINI_MAX_CONTEXT_TOKENS * CHARS_PER_TOKEN;
+}
+
+function getOllamaMaxContextChars(request: TaskRequest): number {
+  return (request.ollamaContextLength || getDefaultLocalContextLength(totalmem())) * CHARS_PER_TOKEN;
+}
+
+function getLmStudioMaxContextChars(): number {
+  return LMSTUDIO_DEFAULT_MAX_CONTEXT_TOKENS * CHARS_PER_TOKEN;
+}
+
+/**
+ * Returns true when the predicted context size N turns from now would exceed the hard limit.
+ * Uses an exponential moving average of per-turn growth to project future size.
+ */
+function predictiveCompressionNeeded(currentChars: number, avgGrowthPerTurn: number, maxChars: number): boolean {
+  if (currentChars < maxChars * CONTEXT_MIN_RATIO_TO_COMPRESS) return false;
+  const projected = currentChars + avgGrowthPerTurn * COMPRESSION_LOOKAHEAD_TURNS;
+  return projected > maxChars * CONTEXT_PROJECTED_LIMIT_RATIO;
+}
+
+/**
+ * Updates the exponential moving average for per-turn context growth.
+ * Call once per turn with the new growth delta.
+ */
+function updateGrowthEma(prev: number, growthThisTurn: number): number {
+  if (prev === 0) return Math.max(0, growthThisTurn);
+  return GROWTH_EMA_ALPHA * Math.max(0, growthThisTurn) + (1 - GROWTH_EMA_ALPHA) * prev;
+}
+
+async function summarizeConversationTurns(turnsText: string, request: TaskRequest, signal?: AbortSignal): Promise<string> {
+  const prompt =
+    "Summarize the following conversation exchange concisely. Preserve all important details: file paths, code changes, decisions, error messages, tool results, and context needed to continue the task.\n\n" +
+    turnsText;
+
+  const provider = getModelProvider(request);
+
+  if (provider === "gemini" && request.apiKey?.trim()) {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${getEffectiveModelName(request)}:generateContent`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": request.apiKey.trim() },
+        signal,
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: { thinkingConfig: { thinkingBudget: 0 } },
+        }),
+      },
+    );
+    if (!response.ok) throw new Error(`Summarization request failed: ${response.status}`);
+    const parsed = (await response.json()) as { candidates?: GeminiCandidate[] };
+    return getTextFromParts(parsed.candidates?.[0]?.content?.parts ?? []);
+  }
+
+  if (provider === "ollama") {
+    const res = await requestOllamaChat(request, [{ role: "user", content: prompt }], false, signal);
+    return res.message?.content ?? "";
+  }
+
+  if (provider === "lmstudio") {
+    const res = await requestLmStudioChat(request, [{ role: "user", content: prompt }], false, signal);
+    const content = res.choices?.[0]?.message?.content;
+    return typeof content === "string" ? content : "";
+  }
+
+  return "";
+}
+
+async function compressGeminiContext(
+  request: TaskRequest,
+  contents: GeminiContent[],
+  signal?: AbortSignal,
+): Promise<GeminiContent[]> {
+  const firstTurn = contents[0];
+  const recentTurns = contents.slice(-COMPRESSION_KEEP_RECENT);
+  const turnsToCompress = contents.slice(1, contents.length - COMPRESSION_KEEP_RECENT);
+  if (turnsToCompress.length === 0) return contents;
+
+  const turnsText = turnsToCompress
+    .map((turn) => `[${turn.role}]: ${getTextFromParts(turn.parts ?? [])}`.trim())
+    .filter(Boolean)
+    .join("\n\n---\n\n");
+
+  try {
+    const summary = await summarizeConversationTurns(turnsText, request, signal);
+    if (!summary.trim()) throw new Error("Empty summary");
+    return [
+      firstTurn,
+      { role: "user", parts: [{ text: `[Earlier conversation — compressed]\n${summary}` }] },
+      { role: "model", parts: [{ text: "Understood, I have the earlier context." }] },
+      ...recentTurns,
+    ];
+  } catch {
+    return [firstTurn, ...recentTurns];
+  }
+}
+
+async function compressOllamaMessages(
+  request: TaskRequest,
+  messages: OllamaMessage[],
+  signal?: AbortSignal,
+): Promise<OllamaMessage[]> {
+  const systemMessage = messages[0];
+  const recentMessages = messages.slice(-COMPRESSION_KEEP_RECENT);
+  const messagesToCompress = messages.slice(1, messages.length - COMPRESSION_KEEP_RECENT);
+  if (messagesToCompress.length === 0) return messages;
+
+  const turnsText = messagesToCompress
+    .map((m) => `[${m.role}]: ${m.content}`.trim())
+    .filter(Boolean)
+    .join("\n\n---\n\n");
+
+  try {
+    const summary = await summarizeConversationTurns(turnsText, request, signal);
+    if (!summary.trim()) throw new Error("Empty summary");
+    return [
+      systemMessage,
+      { role: "user", content: `[Earlier conversation — compressed]\n${summary}` },
+      { role: "assistant", content: "Understood, I have the earlier context." },
+      ...recentMessages,
+    ];
+  } catch {
+    return [systemMessage, ...recentMessages];
+  }
+}
+
+async function compressOpenAiMessages(
+  request: TaskRequest,
+  messages: OpenAiChatMessage[],
+  signal?: AbortSignal,
+): Promise<OpenAiChatMessage[]> {
+  const systemMessage = messages[0];
+  const recentMessages = messages.slice(-COMPRESSION_KEEP_RECENT);
+  const messagesToCompress = messages.slice(1, messages.length - COMPRESSION_KEEP_RECENT);
+  if (messagesToCompress.length === 0) return messages;
+
+  const turnsText = messagesToCompress
+    .map((m) => {
+      const text = typeof m.content === "string" ? m.content : m.content.map((c) => c.text).join("");
+      return `[${m.role}]: ${text}`.trim();
+    })
+    .filter(Boolean)
+    .join("\n\n---\n\n");
+
+  try {
+    const summary = await summarizeConversationTurns(turnsText, request, signal);
+    if (!summary.trim()) throw new Error("Empty summary");
+    return [
+      systemMessage,
+      { role: "user", content: `[Earlier conversation — compressed]\n${summary}` },
+      { role: "assistant", content: "Understood, I have the earlier context." },
+      ...recentMessages,
+    ];
+  } catch {
+    return [systemMessage, ...recentMessages];
+  }
+}
+
+const READ_ONLY_TOOLS = new Set(["read_file", "list_dir", "web_search", "open_webpage", "web_screenshot"]);
+
+async function drainToolCall(
+  call: { name: string; args: Record<string, unknown> },
+  handlers: ToolHandlers,
+): Promise<{ events: AgentStreamEvent[]; part: GeminiPart }> {
+  const events: AgentStreamEvent[] = [];
+  try {
+    const gen = executeToolCall(call, handlers);
+    while (true) {
+      const { done, value } = await gen.next();
+      if (done) return { events, part: value };
+      events.push(value);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      events,
+      part: {
+        functionResponse: {
+          name: call.name,
+          response: { error: `Tool execution failed: ${message}` },
+        },
+      },
+    };
+  }
+}
+
 async function* runGeminiAgentLoop(
   request: TaskRequest,
   decision: ModeDecision,
@@ -1933,16 +2181,83 @@ async function* runGeminiAgentLoop(
   let currentContents = [...contents];
   let turn = 0;
 
+  // Background compression state — never blocks the main loop.
+  let bgCompressionPending = false;
+  let bgCompressedContents: GeminiContent[] | null = null;
+  let bgCompressionSnapshotLength = 0;
+  let prevContextChars = 0;
+  let avgGrowthPerTurn = 0;
+
   while (true) {
+    // Apply background compression if it finished since the last turn.
+    if (bgCompressedContents !== null) {
+      const newTurns = currentContents.slice(bgCompressionSnapshotLength);
+      currentContents = [...bgCompressedContents, ...newTurns];
+      bgCompressedContents = null;
+    }
+
     if (signal?.aborted) {
       yield { type: "done", summary: "Agent request canceled." };
       return;
     }
 
     yield { type: "status", label: turn === 0 ? "Loading" : "Thinking" };
-    const candidate = await requestGeminiWithRetry(request, decision, retrieval, currentContents, signal);
-    const parts = candidate.content?.parts ?? [];
+
+    // Single streaming call with tools enabled — eliminates the previous double-request pattern.
+    let streamedAggregatedText = "";
+    let emittedMessageLength = 0;
+    let emittedCodeLength = 0;
+    let streamedCandidate: GeminiCandidate = {};
+    let hasFence = false;
+
+    for await (const chunk of requestGeminiStreamWithRetry(request, decision, retrieval, currentContents, true, signal)) {
+      if (signal?.aborted) {
+        yield { type: "done", summary: "Agent request canceled." };
+        return;
+      }
+
+      if (chunk.type === "text") {
+        streamedAggregatedText += chunk.delta;
+        // Only scan the new delta for a fence, not the entire accumulated string (O(n) → O(delta)).
+        if (!hasFence) hasFence = chunk.delta.includes("```");
+
+        if (hasFence) {
+          const streamedParts = splitResponseParts(streamedAggregatedText);
+          if (streamedParts.message.length > emittedMessageLength) {
+            const nextMessageChunk = streamedParts.message.slice(emittedMessageLength);
+            emittedMessageLength = streamedParts.message.length;
+            yield { type: "message", chunk: nextMessageChunk };
+          }
+          if (streamedParts.code.length > emittedCodeLength) {
+            const nextCodeChunk = streamedParts.code.slice(emittedCodeLength);
+            emittedCodeLength = streamedParts.code.length;
+            yield { type: "code", chunk: nextCodeChunk };
+          }
+        } else {
+          // Fast path: no code fence detected yet — emit delta directly.
+          yield { type: "message", chunk: chunk.delta };
+          emittedMessageLength += chunk.delta.length;
+        }
+      } else {
+        streamedCandidate = chunk.candidate;
+      }
+    }
+
+    const parts = streamedCandidate.content?.parts ?? [];
     const functionCalls = getFunctionCalls(parts);
+
+    // Flush any remaining content surfaced in the final candidate.
+    const finalText = getTextFromParts(parts);
+    if (finalText) {
+      const finalParts = splitResponseParts(finalText);
+      if (finalParts.message.length > emittedMessageLength) {
+        yield { type: "message", chunk: finalParts.message.slice(emittedMessageLength) };
+        emittedMessageLength = finalParts.message.length;
+      }
+      if (finalParts.code.length > emittedCodeLength) {
+        yield { type: "code", chunk: finalParts.code.slice(emittedCodeLength) };
+      }
+    }
 
     const finishCall = functionCalls.find((call) => call.name === "finish_turn");
     if (finishCall) {
@@ -1961,54 +2276,11 @@ async function* runGeminiAgentLoop(
     }
 
     if (functionCalls.length === 0) {
-      let streamedAggregatedText = "";
-      let emittedMessageLength = 0;
-      let emittedCodeLength = 0;
-      let streamedCandidate: GeminiCandidate = candidate;
-
-      for await (const chunk of requestGeminiStreamWithRetry(request, decision, retrieval, currentContents, false, signal)) {
-        if (signal?.aborted) {
-          yield { type: "done", summary: "Agent request canceled." };
-          return;
-        }
-
-        if (chunk.type === "text") {
-          streamedAggregatedText += chunk.delta;
-          const streamedParts = splitResponseParts(streamedAggregatedText);
-
-          if (streamedParts.message.length > emittedMessageLength) {
-            const nextMessageChunk = streamedParts.message.slice(emittedMessageLength);
-            emittedMessageLength = streamedParts.message.length;
-            yield { type: "message", chunk: nextMessageChunk };
-          }
-
-          if (streamedParts.code.length > emittedCodeLength) {
-            const nextCodeChunk = streamedParts.code.slice(emittedCodeLength);
-            emittedCodeLength = streamedParts.code.length;
-            yield { type: "code", chunk: nextCodeChunk };
-          }
-        } else {
-          streamedCandidate = chunk.candidate;
-        }
-      }
-
-      const aggregatedText = getTextFromParts(streamedCandidate.content?.parts ?? parts);
-      const finalParts = splitResponseParts(aggregatedText);
-
-      if (finalParts.message.length > emittedMessageLength) {
-        yield { type: "message", chunk: finalParts.message.slice(emittedMessageLength) };
-      }
-
-      if (finalParts.code.length > emittedCodeLength) {
-        yield { type: "code", chunk: finalParts.code.slice(emittedCodeLength) };
-      }
-
       currentContents.push({
         role: "model",
-        parts: streamedCandidate.content?.parts ?? parts,
+        parts: parts.length > 0 ? parts : [{ text: streamedAggregatedText }],
       });
-      await waitUntilAborted(signal);
-      yield { type: "done", summary: "Agent request canceled." };
+      yield { type: "done", summary: "Agent turn completed." };
       return;
     }
 
@@ -2017,17 +2289,36 @@ async function* runGeminiAgentLoop(
       parts,
     });
 
+    const callsToExecute = functionCalls.filter((entry) => entry.name !== "finish_turn");
     const responseParts: GeminiPart[] = [];
-    for (const call of functionCalls.filter((entry) => entry.name !== "finish_turn")) {
-      const execution = executeToolCall(call, handlers);
-      const iterator = execution[Symbol.asyncIterator]();
-      while (true) {
-        const next = await iterator.next();
-        if (next.done) {
-          responseParts.push(next.value);
-          break;
+
+    if (callsToExecute.length > 1 && callsToExecute.every((call) => READ_ONLY_TOOLS.has(call.name))) {
+      // Parallel execution for independent read-only tools.
+      const results = await Promise.all(callsToExecute.map((call) => drainToolCall(call, handlers)));
+      for (const { events, part } of results) {
+        for (const event of events) yield event;
+        responseParts.push(part);
+      }
+    } else {
+      // Sequential execution with per-call error handling.
+      for (const call of callsToExecute) {
+        let toolPart: GeminiPart;
+        try {
+          const execution = executeToolCall(call, handlers);
+          const iterator = execution[Symbol.asyncIterator]();
+          while (true) {
+            const next = await iterator.next();
+            if (next.done) {
+              toolPart = next.value;
+              break;
+            }
+            yield next.value;
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          toolPart = { functionResponse: { name: call.name, response: { error: `Tool execution failed: ${message}` } } };
         }
-        yield next.value;
+        responseParts.push(toolPart!);
       }
     }
 
@@ -2035,6 +2326,22 @@ async function* runGeminiAgentLoop(
       role: "user",
       parts: responseParts,
     });
+
+    // Update per-turn growth estimate and launch background compression when needed.
+    const currentChars = estimateGeminiContextChars(currentContents);
+    avgGrowthPerTurn = updateGrowthEma(avgGrowthPerTurn, currentChars - prevContextChars);
+    prevContextChars = currentChars;
+
+    if (!bgCompressionPending && bgCompressedContents === null) {
+      if (predictiveCompressionNeeded(currentChars, avgGrowthPerTurn, getGeminiMaxContextChars())) {
+        bgCompressionPending = true;
+        bgCompressionSnapshotLength = currentContents.length;
+        const snapshot = [...currentContents];
+        compressGeminiContext(request, snapshot, signal)
+          .then((result) => { bgCompressedContents = result; bgCompressionPending = false; })
+          .catch(() => { bgCompressionPending = false; });
+      }
+    }
 
     turn += 1;
   }
@@ -2047,10 +2354,22 @@ async function* runOllamaAgentLoop(
   handlers: ToolHandlers,
   signal?: AbortSignal,
 ): AsyncGenerator<AgentStreamEvent> {
-  const messages = buildOllamaMessages(request, decision, retrieval, request.prompt, request.conversation ?? []);
+  let messages = buildOllamaMessages(request, decision, retrieval, request.prompt, request.conversation ?? []);
   let turn = 0;
 
+  let bgOllamaPending = false;
+  let bgOllamaCompressed: OllamaMessage[] | null = null;
+  let bgOllamaSnapshotLength = 0;
+  let prevOllamaChars = 0;
+  let avgOllamaGrowth = 0;
+
   while (true) {
+    if (bgOllamaCompressed !== null) {
+      const newMsgs = messages.slice(bgOllamaSnapshotLength);
+      messages = [...bgOllamaCompressed, ...newMsgs];
+      bgOllamaCompressed = null;
+    }
+
     if (signal?.aborted) {
       yield { type: "done", summary: "Agent request canceled." };
       return;
@@ -2059,7 +2378,7 @@ async function* runOllamaAgentLoop(
     yield { type: "status", label: turn === 0 ? "Requesting" : "Thinking" };
     let latestResponse: OllamaChatResponse = {};
 
-    for await (const chunk of requestOllamaStream(request, messages, true, signal)) {
+    for await (const chunk of requestOllamaStreamWithRetry(request, messages, true, signal)) {
       if (signal?.aborted) {
         yield { type: "done", summary: "Agent request canceled." };
         return;
@@ -2094,8 +2413,7 @@ async function* runOllamaAgentLoop(
         role: "assistant",
         content: latestResponse.message?.content ?? "",
       });
-      await waitUntilAborted(signal);
-      yield { type: "done", summary: "Agent request canceled." };
+      yield { type: "done", summary: "Agent turn completed." };
       return;
     }
 
@@ -2106,22 +2424,41 @@ async function* runOllamaAgentLoop(
     });
 
     for (const call of toolCalls.filter((entry) => entry.name !== "finish_turn")) {
-      const execution = executeToolCall(call, handlers);
-      const iterator = execution[Symbol.asyncIterator]();
-      while (true) {
-        const next = await iterator.next();
-        if (next.done) {
-          const toolResponse =
-            "functionResponse" in next.value ? next.value.functionResponse?.response : undefined;
-          messages.push({
-            role: "tool",
-            tool_name: call.name,
-            content: JSON.stringify(toolResponse ?? {}),
-          });
-          break;
+      let toolResponse: unknown;
+      try {
+        const execution = executeToolCall(call, handlers);
+        const iterator = execution[Symbol.asyncIterator]();
+        while (true) {
+          const next = await iterator.next();
+          if (next.done) {
+            toolResponse = "functionResponse" in next.value ? next.value.functionResponse?.response : undefined;
+            break;
+          }
+          yield next.value;
         }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        toolResponse = { error: `Tool execution failed: ${message}` };
+      }
+      messages.push({
+        role: "tool",
+        tool_name: call.name,
+        content: JSON.stringify(toolResponse ?? {}),
+      });
+    }
 
-        yield next.value;
+    const currentOllamaChars = estimateOllamaContextChars(messages);
+    avgOllamaGrowth = updateGrowthEma(avgOllamaGrowth, currentOllamaChars - prevOllamaChars);
+    prevOllamaChars = currentOllamaChars;
+
+    if (!bgOllamaPending && bgOllamaCompressed === null) {
+      if (predictiveCompressionNeeded(currentOllamaChars, avgOllamaGrowth, getOllamaMaxContextChars(request))) {
+        bgOllamaPending = true;
+        bgOllamaSnapshotLength = messages.length;
+        const snapshot = [...messages];
+        compressOllamaMessages(request, snapshot, signal)
+          .then((result) => { bgOllamaCompressed = result; bgOllamaPending = false; })
+          .catch(() => { bgOllamaPending = false; });
       }
     }
 
@@ -2136,17 +2473,29 @@ async function* runLmStudioAgentLoop(
   handlers: ToolHandlers,
   signal?: AbortSignal,
 ): AsyncGenerator<AgentStreamEvent> {
-  const messages = buildOpenAiMessages(request, decision, retrieval, request.prompt, request.conversation ?? []);
+  let messages = buildOpenAiMessages(request, decision, retrieval, request.prompt, request.conversation ?? []);
   let turn = 0;
 
+  let bgLmsPending = false;
+  let bgLmsCompressed: OpenAiChatMessage[] | null = null;
+  let bgLmsSnapshotLength = 0;
+  let prevLmsChars = 0;
+  let avgLmsGrowth = 0;
+
   while (true) {
+    if (bgLmsCompressed !== null) {
+      const newMsgs = messages.slice(bgLmsSnapshotLength);
+      messages = [...bgLmsCompressed, ...newMsgs];
+      bgLmsCompressed = null;
+    }
+
     if (signal?.aborted) {
       yield { type: "done", summary: "Agent request canceled." };
       return;
     }
 
     yield { type: "status", label: turn === 0 ? "Loading" : "Thinking" };
-    const response = await requestLmStudioChat(request, messages, true, signal);
+    const response = await requestLmStudioChatWithRetry(request, messages, true, signal);
     const assistantMessage = response.choices?.[0]?.message;
     const assistantContent = typeof assistantMessage?.content === "string" ? assistantMessage.content : "";
     const toolCalls = parseOpenAiToolCalls(response);
@@ -2173,8 +2522,7 @@ async function* runLmStudioAgentLoop(
       if (assistantContent) {
         yield { type: "message", chunk: assistantContent };
       }
-      await waitUntilAborted(signal);
-      yield { type: "done", summary: "Agent request canceled." };
+      yield { type: "done", summary: "Agent turn completed." };
       return;
     }
 
@@ -2185,22 +2533,41 @@ async function* runLmStudioAgentLoop(
     });
 
     for (const call of toolCalls.filter((entry) => entry.name !== "finish_turn")) {
-      const execution = executeToolCall(call, handlers);
-      const iterator = execution[Symbol.asyncIterator]();
-      while (true) {
-        const next = await iterator.next();
-        if (next.done) {
-          const toolResponse =
-            "functionResponse" in next.value ? next.value.functionResponse?.response : undefined;
-          messages.push({
-            role: "tool",
-            tool_call_id: call.id,
-            content: JSON.stringify(toolResponse ?? {}),
-          });
-          break;
+      let toolResponse: unknown;
+      try {
+        const execution = executeToolCall(call, handlers);
+        const iterator = execution[Symbol.asyncIterator]();
+        while (true) {
+          const next = await iterator.next();
+          if (next.done) {
+            toolResponse = "functionResponse" in next.value ? next.value.functionResponse?.response : undefined;
+            break;
+          }
+          yield next.value;
         }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        toolResponse = { error: `Tool execution failed: ${message}` };
+      }
+      messages.push({
+        role: "tool",
+        tool_call_id: call.id,
+        content: JSON.stringify(toolResponse ?? {}),
+      });
+    }
 
-        yield next.value;
+    const currentLmsChars = estimateOpenAiContextChars(messages);
+    avgLmsGrowth = updateGrowthEma(avgLmsGrowth, currentLmsChars - prevLmsChars);
+    prevLmsChars = currentLmsChars;
+
+    if (!bgLmsPending && bgLmsCompressed === null) {
+      if (predictiveCompressionNeeded(currentLmsChars, avgLmsGrowth, getLmStudioMaxContextChars())) {
+        bgLmsPending = true;
+        bgLmsSnapshotLength = messages.length;
+        const snapshot = [...messages];
+        compressOpenAiMessages(request, snapshot, signal)
+          .then((result) => { bgLmsCompressed = result; bgLmsPending = false; })
+          .catch(() => { bgLmsPending = false; });
       }
     }
 
